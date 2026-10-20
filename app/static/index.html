@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>Breakline · 원칙으로 움직이는 투자</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%23162735'/%3E%3Cpath d='M10 27V11m0 11c0-9 15-9 15 0s-15 9-15 0m11-10h10v10m-1-9L20 23' fill='none' stroke='%23d7f4ba' stroke-width='3'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/static/style.css?v=20261020-readable2">
-  <script src="/static/app.js?v=20261020-readable2" defer></script>
+  <link rel="stylesheet" href="/static/style.css?v=20261020-sections80">
+  <script src="/static/app.js?v=20261020-sections80" defer></script>
 </head>
 <body>
   <aside class="sidebar">
@@ -82,9 +82,9 @@
         <aside class="settings-column" id="strategy">
           <section class="panel settings-panel"><div class="panel-heading"><div><p class="section-kicker">YOUR TRADING RULES</p><h2>나의 매매 설정</h2></div><span class="settings-icon">⚙</span></div><p class="section-description">직접 입력한 숫자가 매매의 기준이 됩니다.</p>
             <form id="settings-form">
-              <label class="primary-setting" for="breakout-percent"><span class="setting-title"><span class="setting-number">01</span> 최고가 돌파율 <span class="help-label">음수 입력 가능</span></span><span class="percent-input"><input id="breakout-percent" name="breakout_percent" type="number" step="0.1" min="-99.9" max="1000" value="2" required><span>%</span></span><span class="setting-explanation">전 거래일까지의 역대 최고가 × (1 + 돌파율). −2%이면 최고가의 98%가 돌파선입니다.</span></label>
-              <label class="primary-setting" for="allocation-percent"><span class="setting-title"><span class="setting-number">02</span> 매입 비율</span><span class="percent-input"><input id="allocation-percent" name="allocation_percent" type="number" step="0.1" min="0.1" max="100" value="30" required><span>%</span></span><span class="setting-explanation">각 주문 시점의 남은 주문 가능 현금에 적용합니다.</span></label>
-              <label class="primary-setting" for="stop-loss-percent"><span class="setting-title"><span class="setting-number">03</span> 손절률</span><span class="percent-input"><input id="stop-loss-percent" name="stop_loss_percent" type="number" step="0.1" min="0.1" max="99.9" value="5" required><span>%</span></span><span class="setting-explanation">실제 매수 평균가에서 설정한 비율만큼 하락하면 전량 매도 주문을 냅니다.</span></label>
+              <label class="primary-setting setting-breakout" for="breakout-percent"><span class="setting-title"><span class="setting-number">01</span> 최고가 돌파율 <span class="help-label">음수 입력 가능</span></span><span class="percent-input"><input id="breakout-percent" name="breakout_percent" type="number" step="0.1" min="-99.9" max="1000" value="2" required><span>%</span></span><span class="setting-explanation">전 거래일까지의 역대 최고가 × (1 + 돌파율). −2%이면 최고가의 98%가 돌파선입니다.</span></label>
+              <label class="primary-setting setting-allocation" for="allocation-percent"><span class="setting-title"><span class="setting-number">02</span> 매입 비율</span><span class="percent-input"><input id="allocation-percent" name="allocation_percent" type="number" step="0.1" min="0.1" max="100" value="30" required><span>%</span></span><span class="setting-explanation">각 주문 시점의 남은 주문 가능 현금에 적용합니다.</span></label>
+              <label class="primary-setting setting-stoploss" for="stop-loss-percent"><span class="setting-title"><span class="setting-number">03</span> 손절률</span><span class="percent-input"><input id="stop-loss-percent" name="stop_loss_percent" type="number" step="0.1" min="0.1" max="99.9" value="5" required><span>%</span></span><span class="setting-explanation">실제 매수 평균가에서 설정한 비율만큼 하락하면 전량 매도 주문을 냅니다.</span></label>
               <div class="settings-divider"><span>세부 설정</span></div>
               <label class="compact-setting" for="universe-mode"><span>매매 대상 범위</span><select id="universe-mode" name="universe_mode"><option value="all">전체 시장 자동 검색</option><option value="watchlist">지정한 감시 종목</option></select></label>
               <label class="compact-setting" for="max-positions"><span>최대 보유 종목 수</span><span class="small-input"><input id="max-positions" name="max_positions" type="number" min="1" max="1000" value="5" required><span>종목</span></span></label>
