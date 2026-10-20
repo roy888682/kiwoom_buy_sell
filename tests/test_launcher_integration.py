@@ -185,7 +185,9 @@ class LauncherProcessTests(unittest.TestCase):
         self.fail("Unrelated stdlib HTTP server did not start" + self.diagnostics())
 
     def snapshot(self):
-        with sqlite3.connect(self.data / "trader.sqlite3") as connection:
+        # sqlite3's own context manager ends a transaction but leaves its
+        # connection open, which prevents temporary-file cleanup on Windows.
+        with contextlib.closing(sqlite3.connect(self.data / "trader.sqlite3")) as connection:
             return connection.execute("SELECT value FROM snapshot WHERE id=1").fetchone()[0]
 
     def test_occupied_port_uses_alternate_and_second_launch_reuses_running_engine(self):
