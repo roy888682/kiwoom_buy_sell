@@ -4,7 +4,14 @@ const $ = (id) => document.getElementById(id);
 let state = null;
 let settingsDirty = false;
 let initialized = false;
-let refreshing = false;
+let refreshPromise = null;
+let stateRevision = 0;
+let connectionHealthy = false;
+let mutationOutcomeUnknown = false;
+let connectionMessage = "";
+let lastSyncedAt = null;
+const pendingActions = new Set();
+const connectionGuidance = "바탕화면의 Breakline 실행 또는 프로그램 폴더의 start.bat을 다시 실행하고, 실행 창은 열어두세요.";
 let toastTimer;
 let dialogAction = null;
 
@@ -44,6 +51,32 @@ function dateTime(value, timeOnly = false) {
     : { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false })}).format(parsed);
 }
 
+function syncDateTime(value) {
+  const parsed = new Date(value);
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+  }).formatToParts(parsed).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} KST`;
+}
+
+function showConnectionProblem(error) {
+  connectionHealthy = false;
+  if (error.mutationOutcomeUnknown) mutationOutcomeUnknown = true;
+  connectionMessage = mutationOutcomeUnknown
+    ? "서버에 연결할 수 없습니다. 요청 처리 여부를 확인할 수 없습니다. 같은 동작을 다시 누르기 전에 최신 감시 상태와 주문 내역을 확인하세요."
+    : "서버에 연결할 수 없습니다. 최신 상태를 확인할 때까지 감시를 새로 시작할 수 없습니다.";
+  connectionMessage += "\n" + connectionGuidance + " 상태 조회만 자동으로 다시 시도합니다.";
+  $("global-message").hidden = false;
+  $("global-message").className = "notice error";
+  $("global-message").textContent = connectionMessage;
+  $("connection-label").textContent = "연결 확인 필요";
+  $("connection-message").textContent = connectionMessage;
+  $("connection-dot").className = "connection-dot";
+  $("last-updated").textContent = (lastSyncedAt ? "최근 동기화 " + syncDateTime(lastSyncedAt) : "최근 동기화 없음") + " · 서버 연결 끊김 · 상태 조회 재시도 중";
+  renderControls();
+}
+
 function toast(message, isError = false) {
   clearTimeout(toastTimer);
   $("toast").textContent = message;
@@ -61,25 +94,48 @@ function errorMessage(payload, status) {
 }
 
 async function request(path, method = "GET", body, raw = false) {
-  const options = { method, headers: {}, credentials: "same-origin" };
+  const mutating = !["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase());
+  const options = { method, headers: {}, credentials: "same-origin", cache: "no-store" };
   if (body !== undefined) {
     options.headers["Content-Type"] = raw ? "text/csv; charset=utf-8" : "application/json";
     options.body = raw ? body : JSON.stringify(body);
   }
-  const response = await fetch(path, options);
-  const text = await response.text();
+  let response;
+  let text;
+  try {
+    response = await fetch(path, options);
+    text = await response.text();
+  } catch {
+    const error = new Error(mutating
+      ? "서버 응답을 받지 못해 요청 처리 여부를 확인할 수 없습니다. 같은 동작을 다시 누르기 전에 감시 상태와 주문 내역을 확인하세요. " + connectionGuidance
+      : "서버에 연결할 수 없습니다. " + connectionGuidance);
+    error.isConnectionError = true;
+    error.mutationOutcomeUnknown = mutating;
+    if (mutating) {
+      stateRevision += 1;
+      showConnectionProblem(error);
+      // Reconcile using a read only. Never replay a request that may have run.
+      try { await refresh({ afterMutation: true }); } catch { /* Keep the visible connection warning. */ }
+    }
+    throw error;
+  }
+  if (mutating) stateRevision += 1;
   let data;
   try { data = text ? JSON.parse(text) : {}; } catch { data = { message: text }; }
   if (!response.ok) throw new Error(errorMessage(data, response.status));
+  // Mutation responses already contain the server state. Keep known running
+  // status even if a following read loses its connection, so Stop stays usable.
+  if (mutating && typeof data.running === "boolean" && data.settings && Array.isArray(data.orders)) state = data;
   return data;
 }
 
 async function action(button, task) {
   const disabled = button.disabled;
+  pendingActions.add(button);
   button.disabled = true;
   try { await task(); }
   catch (error) { toast(error.message || "요청 처리 중 오류가 발생했습니다.", true); }
-  finally { button.disabled = disabled; if (state) renderControls(); }
+  finally { pendingActions.delete(button); button.disabled = disabled; renderControls(); }
 }
 
 function fillSettings(settings = {}) {
@@ -94,19 +150,22 @@ function fillSettings(settings = {}) {
 }
 
 function renderControls() {
-  if (!state) return;
-  const running = Boolean(state.running);
-  const live = state.mode === "live";
-  $("engine-status").textContent = `${live ? "키움 연결 거래" : "모의 거래"} · ${running ? "감시 중" : "대기"}`;
+  const running = Boolean(state?.running);
+  const live = state?.mode === "live";
+  $("engine-status").textContent = connectionHealthy
+    ? `${live ? "키움 연결 거래" : "모의 거래"} · ${running ? "감시 중" : "대기"}`
+    : "서버 연결 끊김 · 상태 확인 필요";
   $("engine-status").className = "status-pill" + (running ? " running" : "") + (live ? " live" : "");
   $("start-engine").hidden = running;
-  $("stop-engine").hidden = !running;
-  $("trade-mode").disabled = running;
+  $("start-engine").disabled = !connectionHealthy || mutationOutcomeUnknown || pendingActions.has($("start-engine"));
+  $("stop-engine").hidden = !running && !mutationOutcomeUnknown;
+  $("stop-engine").disabled = pendingActions.has($("stop-engine"));
+  $("trade-mode").disabled = running || !connectionHealthy || mutationOutcomeUnknown;
   if (running) $("trade-mode").value = state.mode || "paper";
   $("live-notice").hidden = $("trade-mode").value !== "live";
   $("demo-scenario").disabled = live;
   $("account-sync-row").hidden = !live || running;
-  const scanner = state.scanner || {};
+  const scanner = state?.scanner || {};
   const scanning = scanner.status === "running";
   $("demo-reset").disabled = running || scanning;
   $("demo-reset-hint").textContent = running
@@ -135,7 +194,7 @@ function renderSummary() {
   $("connection-message").textContent = broker.message || "실제 API 연결에는 환경 변수 설정이 필요합니다.";
   $("connection-dot").className = "connection-dot" + (broker.configured ? " connected" : "");
   $("market-support-note").textContent = broker.message || "API 키와 계좌 연결, 상장 이후 수정주가 이력이 필요합니다. 모의 가격은 실시간 시세가 아닙니다.";
-  const latestError = state.latest_error;
+  const latestError = connectionMessage || state.latest_error;
   $("global-message").hidden = !latestError;
   $("global-message").className = "notice error";
   $("global-message").textContent = latestError || "";
@@ -318,29 +377,40 @@ function renderEvents() {
   }
 }
 
-async function refresh() {
-  if (refreshing) return;
-  refreshing = true;
+async function updateState() {
+  const revision = stateRevision;
   try {
-    state = await request("/api/state");
+    const nextState = await request("/api/state");
+    // A read that started before a mutation completed cannot confirm its result.
+    if (revision !== stateRevision) return updateState();
+    state = nextState;
+    connectionHealthy = true;
+    mutationOutcomeUnknown = false;
+    connectionMessage = "";
     if (!initialized) {
       fillSettings(state.settings);
       $("trade-mode").value = state.mode || "paper";
       initialized = true;
     } else if (!settingsDirty && document.activeElement?.form !== $("settings-form")) fillSettings(state.settings);
     renderSummary(); renderControls(); renderScanner(); renderWatchlist(); renderPositions(); renderOrders(); renderEvents();
-    $("last-updated").textContent = "최근 동기화 " + dateTime(new Date().toISOString(), true);
+    lastSyncedAt = new Date().toISOString();
+    $("last-updated").textContent = "최근 동기화 " + syncDateTime(lastSyncedAt);
   } catch (error) {
-    $("connection-label").textContent = "연결 확인 필요";
-    $("connection-message").textContent = error.message || "로컬 서버에 연결할 수 없습니다.";
-    $("connection-dot").className = "connection-dot";
-    $("last-updated").textContent = "연결 끊김 · 자동 재시도 중";
-    if (!initialized) {
-      $("global-message").hidden = false;
-      $("global-message").className = "notice error";
-      $("global-message").textContent = "프로그램에 연결할 수 없습니다. 서버 실행 상태를 확인하세요.";
-    }
-  } finally { refreshing = false; }
+    showConnectionProblem(error);
+    throw error;
+  }
+}
+
+async function refresh({ afterMutation = false } = {}) {
+  if (refreshPromise) {
+    if (!afterMutation) return refreshPromise;
+    try { await refreshPromise; } catch { /* Make a fresh read after the mutation. */ }
+    if (refreshPromise) return refresh({ afterMutation });
+  }
+  const task = updateState();
+  refreshPromise = task;
+  try { return await task; }
+  finally { if (refreshPromise === task) refreshPromise = null; }
 }
 
 function openDialog({ title, description, fields, submitLabel = "확인", onSubmit }) {
@@ -376,10 +446,16 @@ $("dialog-form").addEventListener("submit", async (event) => {
   $("dialog-error").textContent = "";
   try {
     const data = Object.fromEntries(new FormData(event.currentTarget));
-    await dialogAction(data);
+    const successMessage = await dialogAction(data);
     $("input-dialog").close();
-    await refresh();
-  } catch (error) { $("dialog-error").textContent = error.message; }
+    await refresh({ afterMutation: true });
+    if (successMessage) toast(successMessage);
+  } catch (error) {
+    if (error.mutationOutcomeUnknown || !$("input-dialog").open) {
+      $("input-dialog").close();
+      toast(error.message, true);
+    } else $("dialog-error").textContent = error.message;
+  }
   finally { button.disabled = false; }
 });
 for (const id of ["dialog-close", "dialog-cancel"]) $(id).addEventListener("click", () => $("input-dialog").close());
@@ -403,7 +479,7 @@ function showHistoryDialog(item) {
     submitLabel: "모의 기준 저장",
     onSubmit: async (data) => {
       await request(`/api/watchlist/${encodeURIComponent(item.key)}/history`, "POST", { all_time_high: data.all_time_high, history_through: data.history_through, confirmed_adjusted_complete: data.confirmed_adjusted_complete === "on" });
-      toast("모의 최고가 기준을 저장했습니다.");
+      return "모의 최고가 기준을 저장했습니다.";
     },
   });
 }
@@ -416,7 +492,7 @@ function showTickDialog(item) {
     submitLabel: "가격 전달",
     onSubmit: async (data) => {
       await request(`/api/watchlist/${encodeURIComponent(item.key)}/tick`, "POST", { price: data.price });
-      toast("모의 가격을 전달했습니다. 주문과 활동 기록을 확인하세요.");
+      return "모의 가격을 전달했습니다. 주문과 활동 기록을 확인하세요.";
     },
   });
 }
@@ -429,7 +505,7 @@ function removeWatch(item) {
     submitLabel: "감시 목록에서 삭제",
     onSubmit: async () => {
       await request(`/api/watchlist/${encodeURIComponent(item.key)}`, "DELETE");
-      toast("감시 목록에서 삭제했습니다.");
+      return "감시 목록에서 삭제했습니다.";
     },
   });
 }
@@ -442,7 +518,7 @@ function showCancelDialog(order) {
     submitLabel: "취소 요청",
     onSubmit: async () => {
       await request(`/api/orders/${encodeURIComponent(order.id)}/cancel`, "POST", {});
-      toast("취소 요청을 처리했습니다. 최종 주문 상태를 확인하세요.");
+      return "취소 요청을 처리했습니다. 최종 주문 상태를 확인하세요.";
     },
   });
 }
@@ -461,14 +537,14 @@ function showBindDialog(order) {
       const body = { broker_order_id: data.broker_order_id };
       if (data.broker_order_date) body.broker_order_date = data.broker_order_date;
       await request(`/api/orders/${encodeURIComponent(order.id)}/bind`, "POST", body);
-      toast("키움 주문과 대조했습니다. 체결 상태를 확인하세요.");
+      return "키움 주문과 대조했습니다. 체결 상태를 확인하세요.";
     },
   });
 }
 
 $("account-sync").addEventListener("click", () => action($("account-sync"), async () => {
   await request("/api/account/sync", "POST", {});
-  await refresh();
+  await refresh({ afterMutation: true });
   toast("실계좌와 체결 내역을 동기화했습니다.");
 }));
 
@@ -494,7 +570,7 @@ $("settings-form").addEventListener("submit", (event) => {
     };
     await request("/api/settings", "PUT", settings);
     settingsDirty = false;
-    await refresh();
+    await refresh({ afterMutation: true });
     toast("매매 설정을 저장했습니다.");
     $("save-hint").textContent = "저장되었습니다. 다음 판단부터 적용됩니다.";
   });
@@ -511,21 +587,21 @@ $("start-engine").addEventListener("click", () => {
       onSubmit: async (data) => {
         if (data.confirmation !== "실거래 시작") throw new Error("‘실거래 시작’을 정확히 입력해 주세요.");
         await request("/api/engine/start", "POST", { mode: "live", confirmation: data.confirmation });
-        toast("키움 연결 거래 감시를 시작했습니다.");
+        return "키움 연결 거래 감시를 시작했습니다.";
       },
     });
     return;
   }
   action($("start-engine"), async () => {
     await request("/api/engine/start", "POST", { mode: "paper", confirmation: "" });
-    await refresh();
+    await refresh({ afterMutation: true });
     toast("모의 거래 감시를 시작했습니다.");
   });
 });
 
 $("stop-engine").addEventListener("click", () => action($("stop-engine"), async () => {
   await request("/api/engine/stop", "POST", {});
-  await refresh();
+  await refresh({ afterMutation: true });
   toast("감시와 자동 손절을 중지했습니다. 기존 미체결 주문은 유지됩니다.");
 }));
 
@@ -544,20 +620,20 @@ $("watch-form").addEventListener("submit", (event) => {
     await request("/api/watchlist", "POST", data);
     form.reset();
     form.hidden = true;
-    await refresh();
+    await refresh({ afterMutation: true });
     toast("감시 종목을 추가했습니다. 최고가 이력이 확인되면 매수 판단에 사용됩니다.");
   });
 });
 
 $("scan-start").addEventListener("click", () => action($("scan-start"), async () => {
   const result = await request("/api/scanner/start", "POST", { market: $("scan-market").value });
-  await refresh();
+  await refresh({ afterMutation: true });
   toast(result.message || "시장 탐색을 시작했습니다. 실제 데이터 확보 범위를 확인하세요.");
 }));
 
 $("scan-stop").addEventListener("click", () => action($("scan-stop"), async () => {
   await request("/api/scanner/stop", "POST", {});
-  await refresh();
+  await refresh({ afterMutation: true });
   toast("시장 탐색을 중지했습니다.");
 }));
 
@@ -572,7 +648,7 @@ $("universe-form").addEventListener("submit", (event) => {
     const csv = await file.text();
     const result = await request(`/api/universe/import?market=${encodeURIComponent($("scan-market").value)}`, "POST", csv, true);
     form.reset();
-    await refresh();
+    await refresh({ afterMutation: true });
     toast(result.message || "CSV를 가져왔습니다. 시장 탐색으로 가격 이력을 검증하세요.");
   });
 });
@@ -585,7 +661,7 @@ $("demo-reset").addEventListener("click", () => {
     submitLabel: "샘플로 초기화",
     onSubmit: async () => {
       await request("/api/demo/reset", "POST", {});
-      toast("모의 샘플을 준비했습니다. 감시 시작 후 돌파 시나리오를 실행하세요.");
+      return "모의 샘플을 준비했습니다. 감시 시작 후 돌파 시나리오를 실행하세요.";
     },
   });
 });
@@ -593,7 +669,7 @@ $("demo-reset").addEventListener("click", () => {
 $("demo-scenario").addEventListener("click", () => action($("demo-scenario"), async () => {
   if (!state?.running) throw new Error("먼저 모의 거래 모드에서 ‘감시 시작’을 눌러주세요.");
   const result = await request("/api/demo/scenario", "POST", {});
-  await refresh();
+  await refresh({ afterMutation: true });
   toast(result.message || "모의 돌파 가격을 전달했습니다. 주문 내역을 확인하세요.");
 }));
 
@@ -605,5 +681,5 @@ for (const anchor of document.querySelectorAll(".nav-item")) {
 }
 
 $("today-label").textContent = new Intl.DateTimeFormat("ko-KR", { timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
-refresh();
-setInterval(refresh, 3000);
+refresh().catch(() => {});
+setInterval(() => { refresh().catch(() => {}); }, 3000);
