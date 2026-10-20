@@ -20,6 +20,8 @@ jobs:
             python: "3.13"
           - os: windows-latest
             python: "3.12"
+          - os: windows-latest
+            python: "3.13"
     runs-on: ${{ matrix.os }}
     env:
       PYTHONUTF8: "1"

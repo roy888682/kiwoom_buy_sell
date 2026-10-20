@@ -149,12 +149,13 @@ os._exit(17)
     def test_health_identifies_checkout_and_controller_lock_capability(self):
         from fastapi.testclient import TestClient
         from app.main import create_app
-        with TestClient(create_app(self.path)) as client:
+        with patch.dict(os.environ, {"BREAKLINE_STARTUP_TOKEN": "local-test-startup-nonce"}), TestClient(create_app(self.path)) as client:
             health = client.get("/api/health")
             self.assertEqual(health.status_code, 200)
             self.assertEqual(health.json()["project_id"], project_identity(ROOT))
             self.assertEqual(health.json()["instance_lock_version"], 1)
             self.assertEqual(health.json()["pid"], os.getpid())
+            self.assertEqual(health.json()["startup_token"], "local-test-startup-nonce")
             self.assertIsInstance(health.json()["pid"], int)
             self.assertNotIn("data_dir", health.json())
             self.assertEqual(health.json()["service"], "kiwoom-breakout")

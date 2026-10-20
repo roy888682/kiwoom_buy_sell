@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import secrets
 import signal
 import socket
 import subprocess
@@ -43,7 +44,7 @@ def port_available(port):
         return False
 
 
-def probe_server(port=PORT, root=ROOT, expected_pid=None):
+def probe_server(port=PORT, root=ROOT, expected_pid=None, expected_token=None):
     """Use direct loopback HTTP, independent of browser/system proxy settings."""
     # A bind check is immediate for free ports. Failed loopback connects can
     # consume the full HTTP timeout on Windows, multiplied across the scan.
@@ -63,9 +64,11 @@ def probe_server(port=PORT, root=ROOT, expected_pid=None):
                 data = None
             if isinstance(data, dict) and data.get("status") == "ok" and data.get("service") == "kiwoom-breakout":
                 if not data.get("project_id"):
-                    return "legacy" if expected_pid is None else "other"
+                    return "legacy" if expected_pid is None and expected_token is None else "other"
                 if data.get("project_id") == project_identity(root) and data.get("instance_lock_version") == 1:
-                    if expected_pid is None or data.get("pid") == expected_pid:
+                    pid_matches = expected_pid is None or data.get("pid") == expected_pid
+                    token_matches = expected_token is None or data.get("startup_token") == expected_token
+                    if pid_matches and token_matches:
                         return "ready"
         return "other"
     except (OSError, ValueError, http.client.HTTPException):
@@ -325,12 +328,12 @@ def ensure_runtime(root=ROOT):
     return python
 
 
-def wait_for_ready(process=None, timeout=45, poll_interval=0.25, port=PORT, root=ROOT):
+def wait_for_ready(process=None, timeout=45, poll_interval=0.25, port=PORT, root=ROOT, startup_token=None):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process is not None and process.poll() is not None:
             raise LauncherError("프로그램이 시작 중 종료되었습니다. 위 실행 오류를 확인하세요.")
-        if probe_server(port, root, expected_pid=process.pid if process is not None else None) == "ready":
+        if probe_server(port, root, expected_token=startup_token) == "ready":
             return
         time.sleep(poll_interval)
     raise LauncherError("프로그램 시작을 확인하지 못했습니다. 기존 실행 창과 위 오류를 확인하세요.")
@@ -390,7 +393,9 @@ def run(root=ROOT, opener=None, startup_timeout=45):
             options["start_new_session"] = True
         for attempt in range(3):
             # Installation and manual starts can change availability. Recheck
-            # while holding the launcher lock, then verify the actual child PID.
+            # while holding the launcher lock, then verify this launch's token.
+            # Windows venv python.exe can start a second interpreter process;
+            # the Popen PID need not be the PID serving the health endpoint.
             port, state = choose_endpoint(root)
             url = f"http://{HOST}:{port}"
             if state in {"ready", "legacy"}:
@@ -400,10 +405,12 @@ def run(root=ROOT, opener=None, startup_timeout=45):
             if port != PORT:
                 print(f"8000번 대신 사용 가능한 {port}번 포트로 엽니다. 주소: {url}", flush=True)
             command = [str(python), "-m", "uvicorn", "app.main:app", "--host", HOST, "--port", str(port)]
+            startup_token = secrets.token_urlsafe(32)
+            options["env"] = {**os.environ, "BREAKLINE_STARTUP_TOKEN": startup_token}
             print("프로그램을 시작합니다. 화면이 열릴 때까지 잠시 기다려주세요.", flush=True)
             process = subprocess.Popen(command, **options)
             try:
-                wait_for_ready(process, timeout=startup_timeout, port=port, root=root)
+                wait_for_ready(process, timeout=startup_timeout, port=port, root=root, startup_token=startup_token)
             except LauncherError:
                 exited = process.poll() is not None
                 stop_owned_server(process)

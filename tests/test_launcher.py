@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 import launch
 from app.instance import project_identity
@@ -55,6 +55,16 @@ class ProbeTests(unittest.TestCase):
         body = b'{"status":"ok","service":"kiwoom-breakout"}'
         self.assertEqual(self.probe_response(body), "legacy")
         self.assertEqual(self.probe_response(body, expected_pid=1234), "other")
+        self.assertEqual(self.probe_response(body, expected_token="owned-spawn"), "other")
+
+    def test_startup_token_identifies_real_interpreter_behind_windows_venv_redirector(self):
+        data = {"status": "ok", "service": "kiwoom-breakout",
+                "project_id": project_identity(launch.ROOT), "instance_lock_version": 1,
+                "pid": 5678, "startup_token": "owned-spawn"}
+        body = json.dumps(data).encode()
+        self.assertEqual(self.probe_response(body, expected_token="owned-spawn"), "ready")
+        self.assertEqual(self.probe_response(body, expected_token="another-spawn"), "other")
+        self.assertEqual(self.probe_response(json.dumps({key: value for key, value in data.items() if key != "startup_token"}).encode(), expected_token="owned-spawn"), "other")
 
     def test_failed_http_requires_actual_bind_check_before_calling_port_free(self):
         for available, expected in [(True, "free"), (False, "busy")]:
@@ -175,11 +185,11 @@ class ReadinessTests(unittest.TestCase):
         process.pid = 1234
         process.poll.return_value = None
         with patch("launch.probe_server", side_effect=["free", "busy", "ready"]) as probe, patch("launch.time.sleep"):
-            launch.wait_for_ready(process, timeout=1, port=8001)
+            launch.wait_for_ready(process, timeout=1, port=8001, startup_token="owned-spawn")
         self.assertEqual(probe.call_count, 3)
         for call in probe.call_args_list:
             self.assertEqual(call.args, (8001, launch.ROOT))
-            self.assertEqual(call.kwargs, {"expected_pid": 1234})
+            self.assertEqual(call.kwargs, {"expected_token": "owned-spawn"})
 
     def test_legacy_or_wrong_child_health_never_opens_as_ready(self):
         process = Mock(pid=1234)
@@ -337,9 +347,9 @@ class RunTests(unittest.TestCase):
                 self.assertEqual(launch.run(root, opener=opener), 0)
                 command = spawn.call_args.args[0]
                 self.assertEqual(command, [str(python), "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"])
-                self.assertEqual(spawn.call_args.kwargs["cwd"], root)
+                self.assertEqual(spawn.call_args.kwargs["cwd"], root.resolve())
                 self.assertEqual(events, [("ready", None), ("browser", launch.URL)])
-                ready.assert_called_once_with(child, timeout=45, port=8000, root=root)
+                ready.assert_called_once_with(child, timeout=45, port=8000, root=root.resolve(), startup_token=ANY)
                 stop.assert_called_once_with(child)
                 factory.return_value.release.assert_called_once()
 
@@ -374,8 +384,22 @@ class RunTests(unittest.TestCase):
         with patch("launch.InstanceLock"), patch("launch.ensure_runtime", return_value=Path("python")), patch("launch.subprocess.Popen", return_value=child) as spawn, patch("launch.wait_for_ready") as ready, patch("launch.stop_owned_server"):
             self.assertEqual(launch.run(opener=opener), 0)
             self.assertEqual(spawn.call_args.args[0][-2:], ["--port", "8001"])
-            ready.assert_called_once_with(child, timeout=45, port=8001, root=launch.ROOT)
+            ready.assert_called_once_with(child, timeout=45, port=8001, root=launch.ROOT, startup_token=ANY)
             opener.assert_called_once_with("http://127.0.0.1:8001")
+
+    def test_child_gets_fresh_startup_token_without_changing_parent_environment(self):
+        child = Mock()
+        child.wait.return_value = 0
+        opener = Mock(return_value=True)
+        parent_values = {"BREAKLINE_STARTUP_TOKEN": "parent-old-token", "LAUNCH_TEST_PRESERVED": "kept"}
+        with patch.dict("launch.os.environ", parent_values), patch("launch.secrets.token_urlsafe", return_value="fresh-child-token") as token, patch("launch.InstanceLock"), patch("launch.ensure_runtime", return_value=Path("python")), patch("launch.subprocess.Popen", return_value=child) as spawn, patch("launch.wait_for_ready") as ready, patch("launch.stop_owned_server"):
+            self.assertEqual(launch.run(opener=opener), 0)
+            token.assert_called_once_with(32)
+            child_environment = spawn.call_args.kwargs["env"]
+            self.assertEqual(child_environment["BREAKLINE_STARTUP_TOKEN"], "fresh-child-token")
+            self.assertEqual(child_environment["LAUNCH_TEST_PRESERVED"], "kept")
+            self.assertEqual(os.environ["BREAKLINE_STARTUP_TOKEN"], "parent-old-token")
+            ready.assert_called_once_with(child, timeout=45, port=8000, root=launch.ROOT, startup_token="fresh-child-token")
 
     def test_manual_instance_appearing_during_setup_is_reused_before_spawn(self):
         self.choose.side_effect = [(8000, "free"), (8002, "ready")]
@@ -391,9 +415,11 @@ class RunTests(unittest.TestCase):
         first.poll.return_value = 1
         second.wait.return_value = 0
         opener = Mock(return_value=True)
-        with patch("launch.InstanceLock"), patch("launch.ensure_runtime", return_value=Path("python")), patch("launch.subprocess.Popen", side_effect=[first, second]) as spawn, patch("launch.wait_for_ready", side_effect=[launch.LauncherError("bind race"), None]), patch("launch.port_available", return_value=False), patch("launch.stop_owned_server") as stop:
+        with patch("launch.secrets.token_urlsafe", side_effect=["first-spawn-token", "second-spawn-token"]), patch("launch.InstanceLock"), patch("launch.ensure_runtime", return_value=Path("python")), patch("launch.subprocess.Popen", side_effect=[first, second]) as spawn, patch("launch.wait_for_ready", side_effect=[launch.LauncherError("bind race"), None]) as ready, patch("launch.port_available", return_value=False), patch("launch.stop_owned_server") as stop:
             self.assertEqual(launch.run(opener=opener), 0)
             self.assertEqual([call.args[0][-1] for call in spawn.call_args_list], ["8000", "8001"])
+            self.assertEqual([call.kwargs["env"]["BREAKLINE_STARTUP_TOKEN"] for call in spawn.call_args_list], ["first-spawn-token", "second-spawn-token"])
+            self.assertEqual([call.kwargs["startup_token"] for call in ready.call_args_list], ["first-spawn-token", "second-spawn-token"])
             self.assertEqual([call.args[0] for call in stop.call_args_list], [first, second])
             opener.assert_called_once_with("http://127.0.0.1:8001")
 

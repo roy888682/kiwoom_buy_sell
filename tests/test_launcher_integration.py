@@ -59,9 +59,13 @@ class LauncherProcessTests(unittest.TestCase):
             "KIWOOM_APP_KEY": "", "KIWOOM_SECRET_KEY": "",
             "ALLOW_LIVE_TRADING": "false", "KIWOOM_ENV": "mock", "PYTHONUTF8": "1",
         }
-        self.log = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+        self.log_path = self.directory / "child-processes.log"
+        self.log = self.log_path.open("w+", encoding="utf-8")
         self.addCleanup(self.log.close)
+        self.launch_stdout = io.StringIO()
+        self.launch_stderr = io.StringIO()
         self.spawned = []
+        self.startup_tokens = {}
         self.real_popen = subprocess.Popen
         self.real_lock = launch.InstanceLock
 
@@ -80,6 +84,7 @@ class LauncherProcessTests(unittest.TestCase):
             options.update(stdout=self.log, stderr=subprocess.STDOUT)
             process = self.real_popen(command, **options)
             self.spawned.append(process)
+            self.startup_tokens[process.pid] = options.get("env", {}).get("BREAKLINE_STARTUP_TOKEN")
             self.addCleanup(self.cleanup_process, process)
             return process
         return self.real_popen(command, **options)
@@ -96,7 +101,7 @@ class LauncherProcessTests(unittest.TestCase):
                                headers=headers)
             response = connection.getresponse()
             raw = response.read()
-            self.assertEqual(response.status, 200, raw.decode(errors="replace"))
+            self.assertEqual(response.status, 200, raw.decode(errors="replace") + self.diagnostics())
             return json.loads(raw)
         finally:
             connection.close()
@@ -110,18 +115,48 @@ class LauncherProcessTests(unittest.TestCase):
         stack.enter_context(patch.object(launch, "InstanceLock",
             side_effect=lambda: self.real_lock(self.directory / "launcher.lock")))
         stack.enter_context(patch.object(launch.subprocess, "Popen", side_effect=self.spawn))
-        stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-        stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+        stack.enter_context(contextlib.redirect_stdout(self.launch_stdout))
+        stack.enter_context(contextlib.redirect_stderr(self.launch_stderr))
         return stack
+
+    def diagnostics(self):
+        """Keep fixture-only startup failures visible in Windows CI reports."""
+        self.log.flush()
+        # Read through an independent handle so an active child's write offset
+        # is unchanged. The fixture has blank brokerage keys and isolated data.
+        child_log = self.log_path.read_text(encoding="utf-8", errors="replace")
+        processes = [{"pid": process.pid, "returncode": process.poll()} for process in self.spawned]
+        return (
+            f"\nCandidate ports: {self.ports}\nSpawned processes: {processes}"
+            f"\nLauncher stdout:\n{self.launch_stdout.getvalue()}"
+            f"\nLauncher stderr:\n{self.launch_stderr.getvalue()}"
+            f"\nChild process log:\n{child_log}"
+        )
 
     def assert_own_health(self, url, process):
         health = self.request(url)
         self.assertEqual(health["service"], "kiwoom-breakout")
         self.assertEqual(health["project_id"], project_identity(ROOT))
-        self.assertEqual(health["pid"], process.pid)
+        # On Windows, .venv's python.exe can be a redirector parent rather than
+        # the serving interpreter. The per-spawn nonce identifies our child.
+        self.assertIsInstance(health["pid"], int)
+        self.assertGreater(health["pid"], 0)
+        token = self.startup_tokens[process.pid]
+        self.assertIsInstance(token, str)
+        self.assertTrue(token)
+        self.assertTrue(health.get("startup_token") == token, "Health nonce does not identify this launcher's child")
         self.assertEqual(health["instance_lock_version"], 1)
-        self.assertEqual(launch.probe_server(urlsplit(url).port, ROOT, expected_pid=process.pid), "ready")
+        self.assertEqual(launch.probe_server(urlsplit(url).port, ROOT, expected_token=token), "ready")
         return health
+
+    def assert_serving_port_stopped(self, port):
+        """A redirector exiting alone must not leave its server child alive."""
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if launch.port_available(port):
+                return
+            time.sleep(0.05)
+        self.fail(f"Actual serving port {port} is still occupied after launcher shutdown" + self.diagnostics())
 
     def start_unrelated_http(self):
         # The stdlib CLI runs ThreadingHTTPServer. Its distinct command also
@@ -147,7 +182,7 @@ class LauncherProcessTests(unittest.TestCase):
                 time.sleep(0.05)
             finally:
                 connection.close()
-        self.fail("Unrelated stdlib HTTP server did not start")
+        self.fail("Unrelated stdlib HTTP server did not start" + self.diagnostics())
 
     def snapshot(self):
         with sqlite3.connect(self.data / "trader.sqlite3") as connection:
@@ -162,7 +197,7 @@ class LauncherProcessTests(unittest.TestCase):
             self.assertEqual(url, f"http://{launch.HOST}:{self.ports[1]}")
             self.assertEqual(len(self.spawned), 1)
             child = self.spawned[0]
-            self.assert_own_health(url, child)
+            owner_health = self.assert_own_health(url, child)
             initial = self.request(url, "/api/state")
             self.assertFalse(initial["running"])
             self.assertEqual(initial["mode"], "paper")
@@ -174,10 +209,10 @@ class LauncherProcessTests(unittest.TestCase):
             def nested_opener(nested_url):
                 opened.append(nested_url)
                 self.assertEqual(nested_url, url)
-                self.assert_own_health(nested_url, child)
+                self.assertEqual(self.assert_own_health(nested_url, child)["pid"], owner_health["pid"])
                 return True
 
-            self.assertEqual(launch.run(ROOT, opener=nested_opener, startup_timeout=10), 0)
+            self.assertEqual(launch.run(ROOT, opener=nested_opener, startup_timeout=10), 0, self.diagnostics())
             self.assertEqual(len(self.spawned), 1, "Second launch started another engine")
             self.assertEqual(self.request(url, "/api/state"), started,
                              "Reusing the dashboard changed its trading state")
@@ -187,9 +222,10 @@ class LauncherProcessTests(unittest.TestCase):
             raise KeyboardInterrupt
 
         with self.launcher_context():
-            self.assertEqual(launch.run(ROOT, opener=opener, startup_timeout=30), 0)
+            self.assertEqual(launch.run(ROOT, opener=opener, startup_timeout=30), 0, self.diagnostics())
         self.assertEqual(opened, [f"http://{launch.HOST}:{self.ports[1]}"] * 2)
         self.assertIsNotNone(self.spawned[0].poll(), "Owned server was left running")
+        self.assert_serving_port_stopped(self.ports[1])
         self.assertIsNone(unrelated.poll(), "Unrelated listener was shut down")
 
     def test_manual_second_port_is_rejected_before_shared_snapshot_changes(self):
@@ -219,9 +255,10 @@ class LauncherProcessTests(unittest.TestCase):
             raise KeyboardInterrupt
 
         with self.launcher_context():
-            self.assertEqual(launch.run(ROOT, opener=opener, startup_timeout=30), 0)
+            self.assertEqual(launch.run(ROOT, opener=opener, startup_timeout=30), 0, self.diagnostics())
         self.assertEqual(opened, [f"http://{launch.HOST}:{self.ports[0]}"])
         self.assertIsNotNone(self.spawned[0].poll(), "Owned server was left running")
+        self.assert_serving_port_stopped(self.ports[0])
 
 
 if __name__ == "__main__":

@@ -735,7 +735,8 @@ def create_app(directory=None, broker=None):
     @app.get("/api/health")
     async def health():
         return {"status": "ok", "service": "kiwoom-breakout",
-                "project_id": project_identity(ROOT), "instance_lock_version": 1, "pid": os.getpid()}
+                "project_id": project_identity(ROOT), "instance_lock_version": 1, "pid": os.getpid(),
+                "startup_token": os.environ.get("BREAKLINE_STARTUP_TOKEN", "")}
 
     @app.get("/api/state")
     async def state(request: Request):
