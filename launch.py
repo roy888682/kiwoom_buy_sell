@@ -24,35 +24,175 @@ ROOT = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
 PORT = 8000
 URL = f"http://{HOST}:{PORT}"
+CANDIDATE_PORTS = tuple(range(PORT, PORT + 11))
 
 
 class LauncherError(RuntimeError):
     """An actionable local startup failure."""
 
 
-def probe_server():
-    """Distinguish this dashboard, an unrelated listener, and a free port."""
+def port_available(port):
+    """Check binding too: Windows can reserve a port without a listener."""
     try:
-        with socket.create_connection((HOST, PORT), timeout=0.8):
-            pass
-    except ConnectionRefusedError:
-        return "free"
+        with socket.socket() as listener:
+            if os.name == "nt":
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            listener.bind((HOST, port))
+        return True
     except OSError:
-        return "busy"
-    connection = http.client.HTTPConnection(HOST, PORT, timeout=0.8)
+        return False
+
+
+def probe_server(port=PORT, root=ROOT, expected_pid=None):
+    """Use direct loopback HTTP, independent of browser/system proxy settings."""
+    from app.instance import project_identity
+
+    connection = http.client.HTTPConnection(HOST, port, timeout=0.8)
     try:
         connection.request("GET", "/api/health")
         response = connection.getresponse()
         raw = response.read(4097)
         if response.status == 200 and len(raw) <= 4096:
-            data = json.loads(raw)
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                data = None
             if isinstance(data, dict) and data.get("status") == "ok" and data.get("service") == "kiwoom-breakout":
-                return "ready"
+                if not data.get("project_id"):
+                    return "legacy" if expected_pid is None else "other"
+                if data.get("project_id") == project_identity(root) and data.get("instance_lock_version") == 1:
+                    if expected_pid is None or data.get("pid") == expected_pid:
+                        return "ready"
+        return "other"
     except (OSError, ValueError, http.client.HTTPException):
-        pass
+        return "free" if port_available(port) else "busy"
     finally:
         connection.close()
-    return "busy"
+
+
+def _listener_processes(port):
+    """Read owner names/commands privately; never log command lines or keys."""
+    if os.name == "nt":
+        script = (
+            "$ErrorActionPreference='Stop'; "
+            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); "
+            "$owners=@(Get-NetTCPConnection -State Listen -ErrorAction Stop | "
+            f"Where-Object {{$_.LocalPort -eq {int(port)}}} | "
+            "Select-Object -ExpandProperty OwningProcess -Unique); "
+            "$rows=@(foreach($owner in $owners){ "
+            "Get-CimInstance Win32_Process -Filter ('ProcessId = '+$owner) | "
+            "Select-Object Name,CommandLine }); "
+            "ConvertTo-Json -InputObject $rows -Compress"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if result.returncode:
+                return None
+            rows = json.loads(result.stdout)
+            return rows if isinstance(rows, list) else None
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return None
+    if sys.platform.startswith("linux"):
+        try:
+            inodes = set()
+            for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+                for line in table.read_text().splitlines()[1:]:
+                    fields = line.split()
+                    if fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port:
+                        inodes.add(fields[9])
+            if not inodes:
+                return []
+            socket_links = {f"socket:[{inode}]" for inode in inodes}
+            rows = []
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    owns_socket = False
+                    for link in (entry / "fd").iterdir():
+                        try:
+                            if link.readlink().as_posix() in socket_links:
+                                owns_socket = True
+                                break
+                        except OSError:
+                            continue  # File descriptors can close during inspection.
+                    if owns_socket:
+                        rows.append({"Name": (entry / "comm").read_text().strip(),
+                                     "CommandLine": (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")})
+                except (OSError, PermissionError):
+                    continue
+            return rows or None
+        except (OSError, ValueError, IndexError):
+            return None
+    return None
+
+
+def unsafe_legacy_listener(port):
+    """An old unresponsive trader has no data lock; do not duplicate it."""
+    rows = _listener_processes(port)
+    if rows is None:
+        return True
+    for row in rows:
+        name = str(row.get("Name") or "").lower()
+        command = str(row.get("CommandLine") or "").lower()
+        if "app.main:app" in command or "uvicorn" in name or "uvicorn" in command:
+            return True
+        if name.startswith(("python", "pypy")) or name in {"py", "py.exe"}:
+            # This known unrelated server is useful for local development.
+            if "-m http.server" not in command:
+                return True
+        elif not name:
+            return True
+    return False
+
+
+def scan_endpoints(root):
+    return [(port, probe_server(port, root)) for port in CANDIDATE_PORTS]
+
+
+def existing_endpoint(endpoints):
+    for status in ("ready", "legacy"):
+        for port, state in endpoints:
+            if state == status and (status != "legacy" or port == PORT):
+                return port, state
+    return None
+
+
+def choose_endpoint(root=ROOT, busy_timeout=3, poll_interval=0.25):
+    endpoints = scan_endpoints(root)
+    deadline = time.monotonic() + busy_timeout
+    while True:
+        existing = existing_endpoint(endpoints)
+        if existing:
+            return existing
+        if not any(state == "busy" for _, state in endpoints) or time.monotonic() >= deadline:
+            break
+        time.sleep(poll_interval)
+        endpoints = scan_endpoints(root)
+    for port, state in endpoints:
+        if state == "legacy" or (state in {"busy", "other"} and unsafe_legacy_listener(port)):
+            raise LauncherError(
+                f"{port}번의 기존 서버가 이 프로그램의 이전 실행인지 확인할 수 없습니다. "
+                "이전에 프로그램을 실행했던 검은 창에서 Ctrl+C를 누르고 start.bat을 다시 실행하세요."
+            )
+    for port, state in endpoints:
+        if state == "free":
+            return port, state
+    raise LauncherError("8000~8010번에 사용할 수 있는 포트가 없습니다. 기존 프로그램 실행 창을 확인하세요.")
+
+
+def wait_for_existing(root=ROOT, timeout=45, poll_interval=0.25):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        existing = existing_endpoint(scan_endpoints(root))
+        if existing:
+            return existing[0]
+        time.sleep(poll_interval)
+    raise LauncherError("다른 실행 창의 준비가 끝나지 않았습니다. 그 창에 표시된 오류를 확인하세요.")
 
 
 class InstanceLock:
@@ -181,12 +321,12 @@ def ensure_runtime(root=ROOT):
     return python
 
 
-def wait_for_ready(process=None, timeout=45, poll_interval=0.25):
+def wait_for_ready(process=None, timeout=45, poll_interval=0.25, port=PORT, root=ROOT):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process is not None and process.poll() is not None:
             raise LauncherError("프로그램이 시작 중 종료되었습니다. 위 실행 오류를 확인하세요.")
-        if probe_server() == "ready":
+        if probe_server(port, root, expected_pid=process.pid if process is not None else None) == "ready":
             return
         time.sleep(poll_interval)
     raise LauncherError("프로그램 시작을 확인하지 못했습니다. 기존 실행 창과 위 오류를 확인하세요.")
@@ -216,51 +356,63 @@ def run(root=ROOT, opener=None, startup_timeout=45):
     try:
         if not (3, 11) <= sys.version_info[:2] < (3, 14):
             raise LauncherError("Python 3.11~3.13을 사용하세요.")
-        state = probe_server()
-        if state == "ready":
+        root = Path(root).resolve()
+        existing = existing_endpoint(scan_endpoints(root))
+        if existing:
+            url = f"http://{HOST}:{existing[0]}"
             print("이미 실행 중인 프로그램 화면을 엽니다. 기존 실행 창은 계속 켜두세요.", flush=True)
-            if not opener(URL):
-                raise LauncherError(f"브라우저 주소창에 {URL} 을 직접 입력하세요.")
+            if not opener(url):
+                raise LauncherError(f"브라우저 주소창에 {url} 을 직접 입력하세요.")
             return 0
-        if state == "busy":
-            raise LauncherError("8000번 포트를 다른 프로그램이 사용 중이거나 기존 실행이 준비 중입니다. 기존 창을 확인하세요.")
         lock = InstanceLock()
         if not lock.acquire():
             print("다른 실행 창이 준비 중입니다. 준비가 끝나면 화면을 엽니다.", flush=True)
-            wait_for_ready(timeout=startup_timeout)
-            if not opener(URL):
-                raise LauncherError(f"브라우저 주소창에 {URL} 을 직접 입력하세요.")
+            port = wait_for_existing(root, timeout=startup_timeout)
+            url = f"http://{HOST}:{port}"
+            if not opener(url):
+                raise LauncherError(f"브라우저 주소창에 {url} 을 직접 입력하세요.")
             return 0
-        # Another launcher or a manual start may have finished since the first probe.
-        state = probe_server()
-        if state == "ready":
-            if not opener(URL):
-                raise LauncherError(f"브라우저 주소창에 {URL} 을 직접 입력하세요.")
+        port, state = choose_endpoint(root)
+        if state in {"ready", "legacy"}:
+            url = f"http://{HOST}:{port}"
+            if not opener(url):
+                raise LauncherError(f"브라우저 주소창에 {url} 을 직접 입력하세요.")
             return 0
-        if state != "free":
-            raise LauncherError("8000번 포트가 사용 중입니다. 기존 실행 창을 확인하세요.")
-        python = ensure_runtime(Path(root))
-        state = probe_server()
-        if state == "ready":
-            if not opener(URL):
-                raise LauncherError(f"브라우저 주소창에 {URL} 을 직접 입력하세요.")
-            return 0
-        if state != "free":
-            raise LauncherError("8000번 포트가 사용 중입니다. 기존 실행 창을 확인하세요.")
-        command = [str(python), "-m", "uvicorn", "app.main:app", "--host", HOST, "--port", str(PORT)]
-        options = {"cwd": Path(root)}
+        python = ensure_runtime(root)
+        options = {"cwd": root}
         if os.name == "nt":
             options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             options["start_new_session"] = True
-        print("프로그램을 시작합니다. 화면이 열릴 때까지 잠시 기다려주세요.", flush=True)
-        process = subprocess.Popen(command, **options)
-        wait_for_ready(process, timeout=startup_timeout)
-        print("이 창은 프로그램 실행 창입니다. 사용하는 동안 닫지 마세요.", flush=True)
-        print("화면에서 감시 시작을 눌러야 매매를 시작합니다. 종료는 이 창에서 Ctrl+C를 누르세요.", flush=True)
-        if not opener(URL):
-            print(f"Brave 또는 기본 브라우저 주소창에 {URL} 을 직접 입력하세요.", flush=True)
-        return process.wait()
+        for attempt in range(3):
+            # Installation and manual starts can change availability. Recheck
+            # while holding the launcher lock, then verify the actual child PID.
+            port, state = choose_endpoint(root)
+            url = f"http://{HOST}:{port}"
+            if state in {"ready", "legacy"}:
+                if not opener(url):
+                    raise LauncherError(f"브라우저 주소창에 {url} 을 직접 입력하세요.")
+                return 0
+            if port != PORT:
+                print(f"8000번 대신 사용 가능한 {port}번 포트로 엽니다. 주소: {url}", flush=True)
+            command = [str(python), "-m", "uvicorn", "app.main:app", "--host", HOST, "--port", str(port)]
+            print("프로그램을 시작합니다. 화면이 열릴 때까지 잠시 기다려주세요.", flush=True)
+            process = subprocess.Popen(command, **options)
+            try:
+                wait_for_ready(process, timeout=startup_timeout, port=port, root=root)
+            except LauncherError:
+                exited = process.poll() is not None
+                stop_owned_server(process)
+                process = None
+                if exited and not port_available(port) and attempt < 2:
+                    print("시작 중 포트 사용 상태가 바뀌었습니다. 사용할 주소를 다시 확인합니다.", flush=True)
+                    continue
+                raise
+            print("이 창은 프로그램 실행 창입니다. 사용하는 동안 닫지 마세요.", flush=True)
+            print("화면에서 감시 시작을 눌러야 매매를 시작합니다. 종료는 이 창에서 Ctrl+C를 누르세요.", flush=True)
+            if not opener(url):
+                print(f"Brave 또는 기본 브라우저 주소창에 {url} 을 직접 입력하세요.", flush=True)
+            return process.wait()
     except KeyboardInterrupt:
         print("\n프로그램을 종료합니다. 잠시 기다려주세요.", flush=True)
         return 0

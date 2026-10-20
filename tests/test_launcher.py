@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
 from types import SimpleNamespace
@@ -13,39 +14,137 @@ import unittest
 from unittest.mock import Mock, patch
 
 import launch
+from app.instance import project_identity
 
 
 class ProbeTests(unittest.TestCase):
-    def probe_response(self, body, status=200):
+    def probe_response(self, body, status=200, **options):
         response = Mock(status=status)
         response.read.return_value = body
         connection = Mock()
         connection.getresponse.return_value = response
-        with patch("launch.socket.create_connection"), patch("launch.http.client.HTTPConnection", return_value=connection):
-            result = launch.probe_server()
+        with patch("launch.http.client.HTTPConnection", return_value=connection) as http:
+            result = launch.probe_server(**options)
+        http.assert_called_once_with(launch.HOST, options.get("port", launch.PORT), timeout=0.8)
         connection.request.assert_called_once_with("GET", "/api/health")
         connection.close.assert_called_once()
         response.read.assert_called_once_with(4097)
         return result
 
     def test_only_the_expected_healthy_service_is_reused(self):
-        ready = json.dumps({"status": "ok", "service": "kiwoom-breakout"}).encode()
+        data = {"status": "ok", "service": "kiwoom-breakout",
+                "project_id": project_identity(launch.ROOT), "instance_lock_version": 1, "pid": 1234}
+        ready = json.dumps(data).encode()
         self.assertEqual(self.probe_response(ready), "ready")
+        self.assertEqual(self.probe_response(ready, port=8001, expected_pid=1234), "ready")
         for body, status in [
             (b'{"status":"ok","service":"another-app"}', 200),
             (b'{"status":"starting","service":"kiwoom-breakout"}', 200),
             (ready, 500), (b"not JSON", 200), (b"[]", 200),
             (ready + b" " * 4097, 200),
+            (json.dumps({**data, "project_id": "another-checkout"}).encode(), 200),
+            (json.dumps({**data, "instance_lock_version": 0}).encode(), 200),
         ]:
             with self.subTest(body=body[:60], status=status):
-                self.assertEqual(self.probe_response(body, status), "busy")
+                self.assertEqual(self.probe_response(body, status), "other")
+        self.assertEqual(self.probe_response(ready, expected_pid=5678), "other")
+        with tempfile.TemporaryDirectory(prefix="다른 프로젝트 ") as directory:
+            self.assertEqual(self.probe_response(ready, root=Path(directory)), "other")
 
-    def test_refused_connection_is_free_but_other_socket_errors_are_busy(self):
-        with patch("launch.socket.create_connection", side_effect=ConnectionRefusedError), patch("launch.http.client.HTTPConnection") as http:
-            self.assertEqual(launch.probe_server(), "free")
-            http.assert_not_called()
-        with patch("launch.socket.create_connection", side_effect=TimeoutError):
-            self.assertEqual(launch.probe_server(), "busy")
+    def test_legacy_health_can_be_discovered_but_cannot_confirm_new_child(self):
+        body = b'{"status":"ok","service":"kiwoom-breakout"}'
+        self.assertEqual(self.probe_response(body), "legacy")
+        self.assertEqual(self.probe_response(body, expected_pid=1234), "other")
+
+    def test_failed_http_requires_actual_bind_check_before_calling_port_free(self):
+        for available, expected in [(True, "free"), (False, "busy")]:
+            with self.subTest(available=available), patch("launch.http.client.HTTPConnection") as http, patch("launch.port_available", return_value=available) as check:
+                http.return_value.request.side_effect = TimeoutError
+                self.assertEqual(launch.probe_server(port=8002), expected)
+                check.assert_called_once_with(8002)
+                http.return_value.close.assert_called_once_with()
+
+    def test_bound_listener_is_unavailable_and_release_makes_port_available(self):
+        with socket.socket() as listener:
+            listener.bind((launch.HOST, 0))
+            listener.listen()
+            port = listener.getsockname()[1]
+            self.assertFalse(launch.port_available(port))
+        self.assertTrue(launch.port_available(port))
+
+
+class EndpointTests(unittest.TestCase):
+    def test_healthy_alternate_is_preferred_over_free_default_without_inspection(self):
+        endpoints = [(8000, "free"), (8001, "ready"), (8002, "free")]
+        with patch("launch.scan_endpoints", return_value=endpoints), patch("launch.unsafe_legacy_listener") as inspect:
+            self.assertEqual(launch.choose_endpoint(), (8001, "ready"))
+            inspect.assert_not_called()
+
+    def test_busy_default_becomes_ready_before_starting_another_server(self):
+        with patch("launch.scan_endpoints", side_effect=[[(8000, "busy"), (8001, "free")], [(8000, "ready"), (8001, "free")]]) as scan, patch("launch.time.sleep"), patch("launch.unsafe_legacy_listener") as inspect:
+            self.assertEqual(launch.choose_endpoint(busy_timeout=1), (8000, "ready"))
+            self.assertEqual(scan.call_count, 2)
+            inspect.assert_not_called()
+
+    def test_unrelated_listener_or_reserved_port_uses_first_free_alternate(self):
+        for state in ("other", "busy"):
+            with self.subTest(state=state), patch("launch.scan_endpoints", return_value=[(8000, state), (8001, "free"), (8002, "free")]), patch("launch.unsafe_legacy_listener", return_value=False) as inspect:
+                self.assertEqual(launch.choose_endpoint(busy_timeout=0), (8001, "free"))
+                inspect.assert_called_once_with(8000)
+
+    def test_unknown_or_legacy_trading_listener_prevents_fallback(self):
+        with patch("launch.scan_endpoints", return_value=[(8000, "busy"), (8001, "free")]), patch("launch.unsafe_legacy_listener", return_value=True), self.assertRaises(launch.LauncherError):
+            launch.choose_endpoint(busy_timeout=0)
+
+    def test_only_default_legacy_service_is_eligible_for_unidentified_reuse(self):
+        self.assertEqual(launch.existing_endpoint([(8000, "legacy"), (8001, "free")]), (8000, "legacy"))
+        self.assertIsNone(launch.existing_endpoint([(8000, "free"), (8001, "legacy")]))
+        self.assertEqual(launch.existing_endpoint([(8000, "legacy"), (8001, "ready")]), (8001, "ready"))
+
+    def test_all_unrelated_ports_occupied_reports_no_available_port(self):
+        with patch("launch.scan_endpoints", return_value=[(8000, "other"), (8001, "other")]), patch("launch.unsafe_legacy_listener", return_value=False), self.assertRaises(launch.LauncherError):
+            launch.choose_endpoint(busy_timeout=0)
+
+    def test_lock_contender_discovers_alternate_port_and_does_not_require_default(self):
+        with patch("launch.scan_endpoints", side_effect=[[(8000, "other"), (8001, "free")], [(8000, "other"), (8001, "ready")]]), patch("launch.time.sleep"):
+            self.assertEqual(launch.wait_for_existing(timeout=1), 8001)
+
+
+class ListenerSafetyTests(unittest.TestCase):
+    def test_windows_inspection_returns_no_owners_only_after_successful_query(self):
+        windows = SimpleNamespace(name="nt")
+        result = SimpleNamespace(returncode=0, stdout="[]")
+        with patch("launch.os", windows), patch.object(launch.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True), patch("launch.subprocess.run", return_value=result) as query:
+            self.assertEqual(launch._listener_processes(8000), [])
+        command = query.call_args.args[0]
+        self.assertEqual(command[:4], ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"])
+        self.assertIn("Get-NetTCPConnection -State Listen -ErrorAction Stop", command[4])
+        self.assertIn("Where-Object", command[4])
+        self.assertNotIn("SilentlyContinue", command[4])
+
+    def test_windows_failed_owner_query_is_unknown_instead_of_no_listener(self):
+        windows = SimpleNamespace(name="nt")
+        for result in (SimpleNamespace(returncode=1, stdout="[]"),
+                       SimpleNamespace(returncode=0, stdout="invalid JSON"),
+                       SimpleNamespace(returncode=0, stdout='{"Name":"python.exe"}')):
+            with self.subTest(result=result), patch("launch.os", windows), patch.object(launch.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True), patch("launch.subprocess.run", return_value=result):
+                self.assertIsNone(launch._listener_processes(8000))
+        with patch("launch.os", windows), patch.object(launch.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True), patch("launch.subprocess.run", side_effect=subprocess.TimeoutExpired("powershell.exe", 10)):
+            self.assertIsNone(launch._listener_processes(8000))
+
+    def test_process_inspection_failures_and_old_python_servers_are_unsafe(self):
+        for rows in (None, [{"Name": "python.exe", "CommandLine": None}],
+                     [{"Name": "python.exe", "CommandLine": "python -m uvicorn app.main:app"}],
+                     [{"Name": "uvicorn", "CommandLine": "uvicorn other.app:app"}],
+                     [{"Name": "", "CommandLine": ""}]):
+            with self.subTest(rows=rows), patch("launch._listener_processes", return_value=rows):
+                self.assertTrue(launch.unsafe_legacy_listener(8000))
+
+    def test_known_foreign_listeners_and_no_listener_allow_fallback(self):
+        for rows in ([], [{"Name": "node.exe", "CommandLine": "node server.js"}],
+                     [{"Name": "python.exe", "CommandLine": "python -m http.server 8000"}]):
+            with self.subTest(rows=rows), patch("launch._listener_processes", return_value=rows):
+                self.assertFalse(launch.unsafe_legacy_listener(8000))
 
 
 class LockTests(unittest.TestCase):
@@ -67,8 +166,19 @@ class LockTests(unittest.TestCase):
 class ReadinessTests(unittest.TestCase):
     def test_waits_for_real_health_after_starting_or_unrelated_response(self):
         process = Mock()
+        process.pid = 1234
         process.poll.return_value = None
         with patch("launch.probe_server", side_effect=["free", "busy", "ready"]) as probe, patch("launch.time.sleep"):
+            launch.wait_for_ready(process, timeout=1, port=8001)
+        self.assertEqual(probe.call_count, 3)
+        for call in probe.call_args_list:
+            self.assertEqual(call.args, (8001, launch.ROOT))
+            self.assertEqual(call.kwargs, {"expected_pid": 1234})
+
+    def test_legacy_or_wrong_child_health_never_opens_as_ready(self):
+        process = Mock(pid=1234)
+        process.poll.return_value = None
+        with patch("launch.probe_server", side_effect=["legacy", "other", "ready"]) as probe, patch("launch.time.sleep"):
             launch.wait_for_ready(process, timeout=1)
         self.assertEqual(probe.call_count, 3)
 
@@ -150,10 +260,17 @@ class RunTests(unittest.TestCase):
         self.stderr.__enter__()
         self.addCleanup(self.stdout.__exit__, None, None, None)
         self.addCleanup(self.stderr.__exit__, None, None, None)
+        scan = patch("launch.scan_endpoints", return_value=[(8000, "free")])
+        self.scan = scan.start()
+        self.addCleanup(scan.stop)
+        choose = patch("launch.choose_endpoint", return_value=(8000, "free"))
+        self.choose = choose.start()
+        self.addCleanup(choose.stop)
 
     def test_existing_instance_only_opens_browser_without_process_or_state_change(self):
         opener = Mock(return_value=True)
-        with patch("launch.probe_server", return_value="ready"), patch("launch.InstanceLock") as lock, patch("launch.ensure_runtime") as runtime, patch("launch.subprocess.Popen") as process, patch("launch.stop_owned_server") as stop:
+        self.scan.return_value = [(8000, "ready")]
+        with patch("launch.InstanceLock") as lock, patch("launch.ensure_runtime") as runtime, patch("launch.subprocess.Popen") as process, patch("launch.stop_owned_server") as stop:
             self.assertEqual(launch.run(opener=opener), 0)
             opener.assert_called_once_with(launch.URL)
             lock.assert_not_called()
@@ -161,9 +278,20 @@ class RunTests(unittest.TestCase):
             process.assert_not_called()
             stop.assert_not_called()
 
-    def test_busy_port_never_installs_starts_or_opens_unrelated_service(self):
+    def test_existing_alternate_instance_is_reused_without_install_or_child(self):
         opener = Mock(return_value=True)
-        with patch("launch.probe_server", return_value="busy"), patch("launch.ensure_runtime") as runtime, patch("launch.subprocess.Popen") as process:
+        self.scan.return_value = [(8000, "other"), (8001, "ready")]
+        with patch("launch.InstanceLock") as lock, patch("launch.ensure_runtime") as runtime, patch("launch.subprocess.Popen") as process:
+            self.assertEqual(launch.run(opener=opener), 0)
+            opener.assert_called_once_with("http://127.0.0.1:8001")
+            lock.assert_not_called()
+            runtime.assert_not_called()
+            process.assert_not_called()
+
+    def test_unsafe_busy_listener_never_installs_starts_or_opens_browser(self):
+        opener = Mock(return_value=True)
+        self.choose.side_effect = launch.LauncherError("이전 실행을 확인하세요.")
+        with patch("launch.InstanceLock"), patch("launch.ensure_runtime") as runtime, patch("launch.subprocess.Popen") as process:
             self.assertEqual(launch.run(opener=opener), 1)
             opener.assert_not_called()
             runtime.assert_not_called()
@@ -171,18 +299,19 @@ class RunTests(unittest.TestCase):
 
     def test_second_launcher_waits_then_reuses_without_starting_another_engine(self):
         opener = Mock(return_value=True)
-        with patch("launch.probe_server", return_value="free"), patch("launch.InstanceLock") as factory, patch("launch.wait_for_ready") as ready, patch("launch.ensure_runtime") as runtime, patch("launch.subprocess.Popen") as process:
+        with patch("launch.InstanceLock") as factory, patch("launch.wait_for_existing", return_value=8001) as ready, patch("launch.ensure_runtime") as runtime, patch("launch.subprocess.Popen") as process:
             factory.return_value.acquire.return_value = False
             self.assertEqual(launch.run(opener=opener, startup_timeout=2), 0)
-            ready.assert_called_once_with(timeout=2)
-            opener.assert_called_once_with(launch.URL)
+            ready.assert_called_once_with(launch.ROOT, timeout=2)
+            opener.assert_called_once_with("http://127.0.0.1:8001")
             runtime.assert_not_called()
             process.assert_not_called()
             factory.return_value.release.assert_called_once()
 
     def test_rechecks_instance_after_lock_before_install_or_process(self):
         opener = Mock(return_value=True)
-        with patch("launch.probe_server", side_effect=["free", "ready"]), patch("launch.InstanceLock") as factory, patch("launch.ensure_runtime") as runtime, patch("launch.subprocess.Popen") as process:
+        self.choose.return_value = (8000, "ready")
+        with patch("launch.InstanceLock") as factory, patch("launch.ensure_runtime") as runtime, patch("launch.subprocess.Popen") as process:
             factory.return_value.acquire.return_value = True
             self.assertEqual(launch.run(opener=opener), 0)
             opener.assert_called_once_with(launch.URL)
@@ -197,24 +326,26 @@ class RunTests(unittest.TestCase):
             child = Mock()
             child.wait.return_value = 0
             opener = Mock(side_effect=lambda url: events.append(("browser", url)) or True)
-            with patch("launch.probe_server", return_value="free"), patch("launch.InstanceLock") as factory, patch("launch.ensure_runtime", return_value=python), patch("launch.subprocess.Popen", return_value=child) as spawn, patch("launch.wait_for_ready", side_effect=lambda *a, **kw: events.append(("ready", None))) as ready, patch("launch.stop_owned_server") as stop:
+            with patch("launch.InstanceLock") as factory, patch("launch.ensure_runtime", return_value=python), patch("launch.subprocess.Popen", return_value=child) as spawn, patch("launch.wait_for_ready", side_effect=lambda *a, **kw: events.append(("ready", None))) as ready, patch("launch.stop_owned_server") as stop:
                 factory.return_value.acquire.return_value = True
                 self.assertEqual(launch.run(root, opener=opener), 0)
                 command = spawn.call_args.args[0]
                 self.assertEqual(command, [str(python), "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"])
                 self.assertEqual(spawn.call_args.kwargs["cwd"], root)
                 self.assertEqual(events, [("ready", None), ("browser", launch.URL)])
-                ready.assert_called_once_with(child, timeout=45)
+                ready.assert_called_once_with(child, timeout=45, port=8000, root=root)
                 stop.assert_called_once_with(child)
                 factory.return_value.release.assert_called_once()
 
     def test_startup_failure_never_opens_browser_and_cleans_only_owned_child(self):
         opener = Mock(return_value=True)
         child = Mock()
-        with patch("launch.probe_server", return_value="free"), patch("launch.InstanceLock") as factory, patch("launch.ensure_runtime", return_value=Path("python")), patch("launch.subprocess.Popen", return_value=child), patch("launch.wait_for_ready", side_effect=launch.LauncherError("synthetic startup error")), patch("launch.stop_owned_server") as stop:
+        child.poll.return_value = None
+        with patch("launch.InstanceLock") as factory, patch("launch.ensure_runtime", return_value=Path("python")), patch("launch.subprocess.Popen", return_value=child) as spawn, patch("launch.wait_for_ready", side_effect=launch.LauncherError("synthetic startup error")), patch("launch.stop_owned_server") as stop:
             factory.return_value.acquire.return_value = True
             self.assertEqual(launch.run(opener=opener), 1)
             opener.assert_not_called()
+            spawn.assert_called_once()
             stop.assert_called_once_with(child)
             factory.return_value.release.assert_called_once()
 
@@ -222,10 +353,65 @@ class RunTests(unittest.TestCase):
         opener = Mock(return_value=False)
         child = Mock()
         child.wait.return_value = 0
-        with patch("launch.probe_server", return_value="free"), patch("launch.InstanceLock"), patch("launch.ensure_runtime", return_value=Path("python")), patch("launch.subprocess.Popen", return_value=child), patch("launch.wait_for_ready"), patch("launch.stop_owned_server"):
+        self.choose.return_value = (8001, "free")
+        with patch("launch.InstanceLock"), patch("launch.ensure_runtime", return_value=Path("python")), patch("launch.subprocess.Popen", return_value=child), patch("launch.wait_for_ready"), patch("launch.stop_owned_server"):
             self.assertEqual(launch.run(opener=opener), 0)
             child.wait.assert_called_once_with()
-            self.assertIn(launch.URL, self.output.getvalue())
+            self.assertIn("http://127.0.0.1:8001", self.output.getvalue())
+
+    def test_safe_busy_default_starts_selected_alternate_and_opens_exact_url(self):
+        self.scan.return_value = [(8000, "other"), (8001, "free")]
+        self.choose.return_value = (8001, "free")
+        opener = Mock(return_value=True)
+        child = Mock()
+        child.wait.return_value = 0
+        with patch("launch.InstanceLock"), patch("launch.ensure_runtime", return_value=Path("python")), patch("launch.subprocess.Popen", return_value=child) as spawn, patch("launch.wait_for_ready") as ready, patch("launch.stop_owned_server"):
+            self.assertEqual(launch.run(opener=opener), 0)
+            self.assertEqual(spawn.call_args.args[0][-2:], ["--port", "8001"])
+            ready.assert_called_once_with(child, timeout=45, port=8001, root=launch.ROOT)
+            opener.assert_called_once_with("http://127.0.0.1:8001")
+
+    def test_manual_instance_appearing_during_setup_is_reused_before_spawn(self):
+        self.choose.side_effect = [(8000, "free"), (8002, "ready")]
+        opener = Mock(return_value=True)
+        with patch("launch.InstanceLock"), patch("launch.ensure_runtime", return_value=Path("python")), patch("launch.subprocess.Popen") as spawn:
+            self.assertEqual(launch.run(opener=opener), 0)
+            opener.assert_called_once_with("http://127.0.0.1:8002")
+            spawn.assert_not_called()
+
+    def test_bind_race_stops_failed_child_and_reselects_without_opening_wrong_port(self):
+        self.choose.side_effect = [(8000, "free"), (8000, "free"), (8001, "free")]
+        first, second = Mock(), Mock()
+        first.poll.return_value = 1
+        second.wait.return_value = 0
+        opener = Mock(return_value=True)
+        with patch("launch.InstanceLock"), patch("launch.ensure_runtime", return_value=Path("python")), patch("launch.subprocess.Popen", side_effect=[first, second]) as spawn, patch("launch.wait_for_ready", side_effect=[launch.LauncherError("bind race"), None]), patch("launch.port_available", return_value=False), patch("launch.stop_owned_server") as stop:
+            self.assertEqual(launch.run(opener=opener), 0)
+            self.assertEqual([call.args[0][-1] for call in spawn.call_args_list], ["8000", "8001"])
+            self.assertEqual([call.args[0] for call in stop.call_args_list], [first, second])
+            opener.assert_called_once_with("http://127.0.0.1:8001")
+
+    def test_startup_exit_on_free_port_does_not_loop_or_mask_actual_error(self):
+        child = Mock()
+        child.poll.return_value = 1
+        opener = Mock(return_value=True)
+        with patch("launch.InstanceLock"), patch("launch.ensure_runtime", return_value=Path("python")), patch("launch.subprocess.Popen", return_value=child) as spawn, patch("launch.wait_for_ready", side_effect=launch.LauncherError("real startup failure")), patch("launch.port_available", return_value=True), patch("launch.stop_owned_server") as stop:
+            self.assertEqual(launch.run(opener=opener), 1)
+            spawn.assert_called_once()
+            stop.assert_called_once_with(child)
+            opener.assert_not_called()
+            self.assertIn("real startup failure", self.output.getvalue())
+
+    def test_bind_race_retries_are_bounded_and_never_open_unready_browser(self):
+        children = [Mock() for _ in range(3)]
+        for child in children:
+            child.poll.return_value = 1
+        opener = Mock(return_value=True)
+        with patch("launch.InstanceLock"), patch("launch.ensure_runtime", return_value=Path("python")), patch("launch.subprocess.Popen", side_effect=children) as spawn, patch("launch.wait_for_ready", side_effect=launch.LauncherError("bind race")), patch("launch.port_available", return_value=False), patch("launch.stop_owned_server") as stop:
+            self.assertEqual(launch.run(opener=opener), 1)
+            self.assertEqual(spawn.call_count, 3)
+            self.assertEqual([call.args[0] for call in stop.call_args_list], children)
+            opener.assert_not_called()
 
 
 class ShutdownTests(unittest.TestCase):

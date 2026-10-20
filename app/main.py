@@ -24,6 +24,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .marketdata import compute_history, market_day, parse_history_csv, previous_session, session_open
 from .storage import Store
+from .instance import project_identity
 from .strategy import (OPEN_STATUSES, Decision, Instrument, Order, Portfolio,
                        Position, Settings, Strategy, decimal, serialize, utcnow)
 
@@ -65,41 +66,47 @@ def fresh_quote(quote):
 class Controller:
     def __init__(self, directory=None, broker=None):
         self.store = Store(directory or os.getenv("TRADER_DATA_DIR", str(ROOT / "data")))
-        saved = self.store.load() or {}
-        self.settings = Settings(**saved.get("settings", {}))
-        self.instruments = {k: Instrument(**instrument_fields(v)) for k, v in saved.get("instruments", {}).items()}
-        # Samples from a previous process are never treated as fresh crossings.
-        for item in self.instruments.values():
-            item.previous_price = item.current_price = None
-        self.metadata = saved.get("metadata", {})
-        self.portfolios = {m: restore_portfolio(saved.get("portfolios", {}).get(m, {})) for m in ("paper", "live")}
-        if not saved:
-            self.portfolios["paper"].cash = {"KRW": Decimal("10000000"), "USD": Decimal("10000")}
-        self.mode = saved.get("mode", "paper")
-        self.broker_orders = saved.get("broker_orders", {})
-        self.broker_order_dates = saved.get("broker_order_dates", {})
-        self.events = saved.get("events", [])[-300:]
-        self.running = False
-        self.latest_error = None
-        self.lock = asyncio.Lock()
-        self.worker_task = None
-        self.scan_task = None
-        self.scan_enabled = False
-        self.stopping = False
-        self.feeds = {}
-        self.feed_tasks = {}
-        self.feed_status = {}
-        self.last_ticks = {}
-        self.expected_sessions = {}
-        self.broker = broker
-        self.scanner = {"status": "idle", "market": "ALL", "processed": 0, "total": 0,
-                        "candidates": 0, "universe_count": len(self.instruments), "last_error": None,
-                        "coverage_message": "전체 시장 검색 전입니다. 예제 종목을 전체 시장으로 표시하지 않습니다."}
-        for order in self.portfolios["live"].orders.values():
-            if order.status in OPEN_STATUSES and not self.broker_orders.get(order.id):
-                order.status = "unknown"
-        self.event("info", "프로그램 시작: 자동매매는 정지 상태입니다.")
-        self.save()
+        try:
+            saved = self.store.load() or {}
+            self.settings = Settings(**saved.get("settings", {}))
+            self.instruments = {k: Instrument(**instrument_fields(v)) for k, v in saved.get("instruments", {}).items()}
+            # Samples from a previous process are never treated as fresh crossings.
+            for item in self.instruments.values():
+                item.previous_price = item.current_price = None
+            self.metadata = saved.get("metadata", {})
+            self.portfolios = {m: restore_portfolio(saved.get("portfolios", {}).get(m, {})) for m in ("paper", "live")}
+            if not saved:
+                self.portfolios["paper"].cash = {"KRW": Decimal("10000000"), "USD": Decimal("10000")}
+            self.mode = saved.get("mode", "paper")
+            self.broker_orders = saved.get("broker_orders", {})
+            self.broker_order_dates = saved.get("broker_order_dates", {})
+            self.events = saved.get("events", [])[-300:]
+            self.running = False
+            self.latest_error = None
+            self.lock = asyncio.Lock()
+            self.worker_task = None
+            self.scan_task = None
+            self.scan_enabled = False
+            self.stopping = False
+            self.feeds = {}
+            self.feed_tasks = {}
+            self.feed_status = {}
+            self.last_ticks = {}
+            self.expected_sessions = {}
+            self.broker = broker
+            self.scanner = {"status": "idle", "market": "ALL", "processed": 0, "total": 0,
+                            "candidates": 0, "universe_count": len(self.instruments), "last_error": None,
+                            "coverage_message": "전체 시장 검색 전입니다. 예제 종목을 전체 시장으로 표시하지 않습니다."}
+            for order in self.portfolios["live"].orders.values():
+                if order.status in OPEN_STATUSES and not self.broker_orders.get(order.id):
+                    order.status = "unknown"
+            self.event("info", "프로그램 시작: 자동매매는 정지 상태입니다.")
+            self.save()
+        except BaseException:
+            # Initialization starts no workers; release ownership if restoring
+            # invalid state or writing the initial snapshot fails.
+            self.store.close()
+            raise
 
     @property
     def portfolio(self):
@@ -637,9 +644,14 @@ class Controller:
             self.scan_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.scan_task
-        if self.broker:
-            await self.broker.close()
-        self.store.close()
+        # stop() must succeed before releasing the data-directory lock. If it
+        # fails, a worker or in-flight order may still own this state; process
+        # exit will release the OS lock after all tasks have actually ended.
+        try:
+            if self.broker:
+                await self.broker.close()
+        finally:
+            self.store.close()
 
 
 class StrictModel(BaseModel):
@@ -680,8 +692,10 @@ def create_app(directory=None, broker=None):
     @asynccontextmanager
     async def lifespan(app):
         app.state.controller = Controller(directory, broker)
-        yield
-        await app.state.controller.close()
+        try:
+            yield
+        finally:
+            await app.state.controller.close()
 
     app = FastAPI(title="돌파 · Kiwoom Breakout", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "[::1]", "testserver"])
@@ -720,7 +734,8 @@ def create_app(directory=None, broker=None):
 
     @app.get("/api/health")
     async def health():
-        return {"status": "ok", "service": "kiwoom-breakout"}
+        return {"status": "ok", "service": "kiwoom-breakout",
+                "project_id": project_identity(ROOT), "instance_lock_version": 1, "pid": os.getpid()}
 
     @app.get("/api/state")
     async def state(request: Request):
