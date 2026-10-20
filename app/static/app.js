@@ -104,11 +104,16 @@ function renderControls() {
   $("trade-mode").disabled = running;
   if (running) $("trade-mode").value = state.mode || "paper";
   $("live-notice").hidden = $("trade-mode").value !== "live";
-  $("demo-reset").disabled = running;
   $("demo-scenario").disabled = live;
   $("account-sync-row").hidden = !live || running;
   const scanner = state.scanner || {};
   const scanning = scanner.status === "running";
+  $("demo-reset").disabled = running || scanning;
+  $("demo-reset-hint").textContent = running
+    ? "감시 중에는 샘플을 초기화할 수 없습니다. 위쪽 ‘감시 중지’를 누른 뒤 실행하세요."
+    : scanning
+      ? "시장 탐색 중에는 샘플을 초기화할 수 없습니다. ‘탐색 중지’를 누른 뒤 실행하세요."
+      : "샘플 초기화는 모의 현금·보유·주문과 예제 종목을 초기화합니다. 사용자 종목 이력은 유지됩니다.";
   $("scan-start").disabled = scanning;
   $("scan-stop").hidden = !scanning;
   $("scan-market").disabled = scanning;

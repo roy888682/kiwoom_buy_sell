@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>Breakline · 원칙으로 움직이는 투자</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%23162735'/%3E%3Cpath d='M10 27V11m0 11c0-9 15-9 15 0s-15 9-15 0m11-10h10v10m-1-9L20 23' fill='none' stroke='%23d7f4ba' stroke-width='3'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/static/style.css">
-  <script src="/static/app.js" defer></script>
+  <link rel="stylesheet" href="/static/style.css?v=20261020-readable2">
+  <script src="/static/app.js?v=20261020-readable2" defer></script>
 </head>
 <body>
   <aside class="sidebar">
@@ -31,6 +31,17 @@
       <section class="page-heading"><div><p class="eyebrow">A CLEAR RULE. A CALMER TRADE.</p><h1>돌파의 순간을, 원칙대로.</h1><p class="page-description">시장을 살피고, 정한 기준에 따라 매수와 손절을 실행하세요.</p></div><div class="engine-controls"><span class="status-pill" id="engine-status">상태 확인 중</span><div class="start-actions"><label class="sr-only" for="trade-mode">실행 모드</label><select id="trade-mode"><option value="paper">모의 거래</option><option value="live">키움 실거래</option></select><button id="start-engine" class="button button-dark"><span>▶</span> 감시 시작</button><button id="stop-engine" class="button button-danger" hidden>■ 감시 중지</button></div></div></section>
       <div id="global-message" class="notice" role="status" aria-live="polite" hidden></div>
       <div id="live-notice" class="notice notice-warning" hidden>키움 연결 거래는 별도 활성화와 API 키가 필요합니다. 거래 가능 시장과 데이터 이력 범위를 먼저 확인하세요.</div>
+
+      <section class="panel demo-quickstart" aria-labelledby="demo-quickstart-title">
+        <div class="quickstart-heading"><div><p class="section-kicker">PAPER TRADING QUICK START</p><h2 id="demo-quickstart-title">처음 사용하시나요? 모의 거래 시작</h2></div><span class="tag tag-teal">실제 주문 없는 연습</span></div>
+        <div class="quickstart-actions"><button class="button button-teal" id="demo-reset" type="button" aria-describedby="demo-reset-hint">샘플 초기화</button><button class="button button-dark" id="demo-scenario" type="button">돌파 시나리오 실행 ↗</button></div>
+        <ol class="quickstart-steps">
+          <li><strong>샘플 초기화</strong><span>위 버튼으로 가상 현금과 예제 종목을 준비하세요.</span></li>
+          <li><strong>모의 거래 선택 → 감시 시작</strong><span>화면 위쪽 실행 모드를 ‘모의 거래’로 선택하고 ‘감시 시작’을 누르세요.</span></li>
+          <li><strong>돌파 시나리오 실행</strong><span>위 버튼으로 가격 돌파를 재현한 뒤 주문 내역을 확인하세요.</span></li>
+        </ol>
+        <p class="quickstart-hint" id="demo-reset-hint" role="status">샘플 초기화는 감시와 시장 탐색을 멈춘 상태에서 실행할 수 있습니다.</p>
+      </section>
 
       <section class="summary-grid" aria-label="계좌 요약">
         <article class="summary-card summary-primary"><div class="summary-label">국내 주문 가능 현금 <span>KRW</span></div><div class="summary-value" id="cash-krw">—</div><p>수수료 · 미체결 예약 금액 반영</p><svg class="summary-decoration" viewBox="0 0 130 65" aria-hidden="true"><path d="M0 60 L24 44 L40 51 L63 25 L78 34 L103 10 L130 0"/></svg></article>
@@ -59,7 +70,6 @@
             <p class="section-description">가격이 돌파 기준선 아래에서 위로 넘어올 때 매수합니다. 첫 가격은 기준 관측값으로만 사용합니다.</p>
             <form id="watch-form" class="watch-form" hidden><select name="market" aria-label="종목 시장"><option value="KR">국내</option><option value="US">미국</option></select><input name="symbol" required maxlength="20" placeholder="005930 / AAPL" aria-label="종목 코드"><input name="name" maxlength="80" placeholder="종목 이름 (선택)" aria-label="종목 이름"><button class="button button-dark" type="submit">추가</button></form>
             <div class="watchlist" id="watchlist-content"><div class="empty-state">감시 종목을 불러오는 중입니다.</div></div>
-            <div class="paper-tools"><div><strong>모의 거래로 먼저 익혀보세요</strong><p>실제 주문 없이 가격 돌파와 손절 흐름을 확인할 수 있습니다.</p></div><div><button class="text-button" id="demo-reset">샘플 초기화</button><button class="button button-quiet" id="demo-scenario">돌파 시나리오 실행 ↗</button></div></div>
           </section>
 
           <section class="panel" id="portfolio"><div class="panel-heading"><div><p class="section-kicker">MY PORTFOLIO</p><h2>보유 종목</h2></div><span class="tag">실제 체결 평균가 기준</span></div><div class="table-wrap"><table><thead><tr><th>종목</th><th class="numeric">수량</th><th class="numeric">평균 매수가</th><th class="numeric">현재가</th><th class="numeric">손절 기준</th></tr></thead><tbody id="positions-content"></tbody></table></div><div class="empty-state" id="positions-empty">아직 보유한 종목이 없습니다.</div><div id="account-sync-row" hidden><button id="account-sync" class="text-button">↻ 실계좌 · 체결 내역 동기화</button><p class="section-description">정지 상태에서만 가능합니다. 다시 시작하기 전에 계좌 상태를 확인하세요.</p></div></section>
