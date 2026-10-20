@@ -23,19 +23,25 @@
 
 ## 설치와 실행
 
-Python **3.11~3.13**과 [uv](https://docs.astral.sh/uv/getting-started/installation/)가 필요합니다. 아래 명령은 저장소 최상위 폴더에서 실행합니다. 기존 `.env`는 덮어쓰지 않습니다.
+### Windows: start.bat 더블클릭
 
-Linux / macOS:
+Python **3.11~3.13**을 설치한 뒤, 프로그램 폴더의 **[start.bat](start.bat)을 더블클릭**하세요. `start.bat`은 `launch.py`, `pyproject.toml`과 같은 폴더에 있어야 합니다. PowerShell에 실행 명령을 입력하거나 `uv` 경로를 따로 설정할 필요가 없습니다.
 
-```bash
-git clone https://github.com/roy888682/kiwoom_buy_sell.git
-cd kiwoom_buy_sell
-uv sync --frozen
-[ -f .env ] || cp .env.example .env
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
+처음 실행할 때 필요한 의존성이 없으면 자동으로 설치하므로 인터넷 연결이 필요합니다. 준비가 끝나면 Brave의 일반 설치 위치를 확인해 Brave로 화면을 열고, 찾지 못하면 Windows 기본 브라우저로 엽니다.
 
-Windows PowerShell:
+이미 프로그램을 설치했다면 **[start.bat](start.bat)과 [launch.py](launch.py) 두 파일만** 받아 기존 프로그램 폴더에 넣어도 됩니다. 전체 ZIP을 다시 받거나 기존 설치를 지울 필요가 없습니다. 기존 `.env`와 `data` 폴더는 그대로 두세요.
+
+- 서버를 시작한 실행창은 프로그램을 사용하는 동안 열어 두세요. **브라우저만 닫아도 서버는 계속 실행됩니다.**
+- 실행창에서 **Ctrl+C**를 누르면 이 실행기가 시작한 서버를 종료합니다.
+- 서버가 이미 정상 실행 중이면 기존 서버를 재사용합니다. 이때 기존 서버를 종료하려면 그 서버를 처음 실행한 창에서 중지하세요.
+- 실행기는 API 키를 입력하거나 자동매매를 시작하지 않습니다. 매매 감시는 화면에서 **감시 시작**을 직접 눌러야 합니다.
+
+바탕화면에서 실행하려면 `start.bat`을 마우스 오른쪽 버튼으로 눌러 **보내기 → 바탕 화면에 바로 가기 만들기**를 선택하세요. Windows 11에서는 먼저 **추가 옵션 표시**를 눌러야 할 수 있습니다.
+
+<details>
+<summary>고급: PowerShell에서 직접 설치하고 실행하기</summary>
+
+이 방식은 Python과 [uv](https://docs.astral.sh/uv/getting-started/installation/)를 직접 설치한 경우에 사용합니다. 아래 명령은 한 줄씩 실행합니다.
 
 ```powershell
 git clone https://github.com/roy888682/kiwoom_buy_sell.git
@@ -45,7 +51,21 @@ if (!(Test-Path .env)) { Copy-Item .env.example .env }
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-자신의 PC에서 실행한 경우 브라우저 주소창에 `127.0.0.1:8000`을 입력합니다. 서버는 실행한 터미널에서 계속 동작해야 합니다. API 키를 입력하거나 변경했다면 서버를 다시 시작하세요.
+</details>
+
+### Linux / macOS
+
+Python **3.11~3.13**과 [uv](https://docs.astral.sh/uv/getting-started/installation/)가 필요합니다. 아래 명령은 저장소 최상위 폴더에서 실행합니다. 기존 `.env`는 덮어쓰지 않습니다.
+
+```bash
+git clone https://github.com/roy888682/kiwoom_buy_sell.git
+cd kiwoom_buy_sell
+uv sync --frozen
+[ -f .env ] || cp .env.example .env
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+브라우저가 자동으로 열리지 않거나 직접 실행한 경우 브라우저 주소창에 `127.0.0.1:8000`을 입력합니다. 서버는 실행한 터미널에서 계속 동작해야 합니다. API 키를 입력하거나 변경했다면 서버를 다시 시작하세요.
 
 Brave에서도 새 탭의 주소창에 `http://127.0.0.1:8000`을 직접 입력하면 됩니다. 채팅 안의 웹 미리보기와 별도로 열리며, `F11`로 전체 화면을 사용할 수 있습니다. 화면 글자는 초기 화면의 1.6배(직전 확대 화면의 80%)를 기본으로 사용하며, 각 영역은 배경색과 테두리로 구분합니다. **샘플 초기화**와 **돌파 시나리오 실행**은 화면 상단의 초록색 모의 거래 안내 영역에 있습니다.
 
@@ -87,6 +107,7 @@ uv run python -m unittest discover -s tests -v
 
 | 파일 | 역할 |
 | --- | --- |
+| `start.bat`, `launch.py` | Windows 더블클릭 실행, 필요한 의존성 준비, 서버 확인 및 브라우저 열기 |
 | `app/main.py` | 로컬 API, 검색·실시간 감시·주문 조정 |
 | `app/strategy.py` | Decimal 기반 매매 규칙과 누적 체결 장부 |
 | `app/marketdata.py` | 거래일·정규장·수정 최고가·CSV 검증 |
