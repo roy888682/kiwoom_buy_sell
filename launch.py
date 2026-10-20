@@ -45,6 +45,10 @@ def port_available(port):
 
 def probe_server(port=PORT, root=ROOT, expected_pid=None):
     """Use direct loopback HTTP, independent of browser/system proxy settings."""
+    # A bind check is immediate for free ports. Failed loopback connects can
+    # consume the full HTTP timeout on Windows, multiplied across the scan.
+    if port_available(port):
+        return "free"
     from app.instance import project_identity
 
     connection = http.client.HTTPConnection(HOST, port, timeout=0.8)

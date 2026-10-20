@@ -23,7 +23,7 @@ class ProbeTests(unittest.TestCase):
         response.read.return_value = body
         connection = Mock()
         connection.getresponse.return_value = response
-        with patch("launch.http.client.HTTPConnection", return_value=connection) as http:
+        with patch("launch.port_available", return_value=False), patch("launch.http.client.HTTPConnection", return_value=connection) as http:
             result = launch.probe_server(**options)
         http.assert_called_once_with(launch.HOST, options.get("port", launch.PORT), timeout=0.8)
         connection.request.assert_called_once_with("GET", "/api/health")
@@ -58,11 +58,17 @@ class ProbeTests(unittest.TestCase):
 
     def test_failed_http_requires_actual_bind_check_before_calling_port_free(self):
         for available, expected in [(True, "free"), (False, "busy")]:
-            with self.subTest(available=available), patch("launch.http.client.HTTPConnection") as http, patch("launch.port_available", return_value=available) as check:
+            with self.subTest(available=available), patch("launch.http.client.HTTPConnection") as http, patch("launch.port_available", side_effect=[False, available]) as check:
                 http.return_value.request.side_effect = TimeoutError
                 self.assertEqual(launch.probe_server(port=8002), expected)
-                check.assert_called_once_with(8002)
+                self.assertEqual([call.args for call in check.call_args_list], [(8002,), (8002,)])
                 http.return_value.close.assert_called_once_with()
+
+    def test_free_port_skips_http_without_waiting_for_connection_timeout(self):
+        with patch("launch.port_available", return_value=True) as check, patch("launch.http.client.HTTPConnection") as http:
+            self.assertEqual(launch.probe_server(port=8002), "free")
+            check.assert_called_once_with(8002)
+            http.assert_not_called()
 
     def test_bound_listener_is_unavailable_and_release_makes_port_available(self):
         with socket.socket() as listener:
