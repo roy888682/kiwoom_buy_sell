@@ -439,7 +439,17 @@ def run(root=ROOT, opener=None, startup_timeout=45):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Start Breakline locally and open Brave or your default browser.")
-    parser.parse_args(argv)
+    options = parser.add_mutually_exclusive_group()
+    options.add_argument("--background", action="store_true")
+    options.add_argument("--stop-background", action="store_true")
+    args = parser.parse_args(argv)
+    if args.background or args.stop_background:
+        import background
+        try:
+            return background.stop() if args.stop_background else background.start()
+        except (LauncherError, OSError) as exc:
+            print(f"실행하지 못했습니다: {exc}", file=sys.stderr, flush=True)
+            return 1
     return run()
 
 

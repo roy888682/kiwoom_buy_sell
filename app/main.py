@@ -1,6 +1,6 @@
 """Local dashboard and persistent, single-writer trading orchestration.
 
-Nothing trades at import or server startup. Live requests need credentials, an
+Real-money trading never starts automatically. Live requests need credentials, an
 environment opt-in, explicit UI arming, verified history and fresh market data.
 """
 from __future__ import annotations
@@ -11,7 +11,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from dataclasses import fields
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -27,6 +27,7 @@ from .storage import Store
 from .instance import project_identity
 from .strategy import (OPEN_STATUSES, Decision, Instrument, Order, Portfolio,
                        Position, Settings, Strategy, decimal, serialize, utcnow)
+from .valuation import value_portfolio
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env", override=False)
@@ -74,10 +75,25 @@ class Controller:
             for item in self.instruments.values():
                 item.previous_price = item.current_price = None
             self.metadata = saved.get("metadata", {})
-            self.portfolios = {m: restore_portfolio(saved.get("portfolios", {}).get(m, {})) for m in ("paper", "live")}
+            self.portfolios = {m: restore_portfolio(saved.get("portfolios", {}).get(m, {})) for m in ("paper", "market_paper", "live")}
             if not saved:
                 self.portfolios["paper"].cash = {"KRW": Decimal("10000000"), "USD": Decimal("10000")}
+            if "market_paper" not in saved.get("portfolios", {}):
+                self.portfolios["market_paper"].cash = {"KRW": Decimal("10000000"), "USD": Decimal("10000")}
             self.mode = saved.get("mode", "paper")
+            paper = saved.get("paper", {})
+            # Legacy virtual fills belong to the example ledger, never the
+            # newly introduced real-market simulation ledger.
+            self.paper_source = paper.get("source", "demo" if saved else "market")
+            self.paper_market = paper.get("market", "ALL")
+            self.paper_recovery_enabled = bool(paper.get("recovery_enabled", True))
+            self.paper_requested = bool(paper.get("resume_requested", False))
+            self.paper_retry_at = None
+            self.paper_retry_count = 0
+            self.paper_last_error = None
+            self.paper_generation = 0
+            self.recovery_task = None
+            self.closing = False
             self.broker_orders = saved.get("broker_orders", {})
             self.broker_order_dates = saved.get("broker_order_dates", {})
             self.events = saved.get("events", [])[-300:]
@@ -110,7 +126,21 @@ class Controller:
 
     @property
     def portfolio(self):
-        return self.portfolios[self.mode]
+        return self.portfolios["market_paper" if self.market_paper else self.mode]
+
+    @property
+    def market_paper(self):
+        return self.mode == "paper" and self.paper_source == "market"
+
+    def selected_markets(self):
+        return ("KR", "US") if not self.market_paper or self.paper_market == "ALL" else (self.paper_market,)
+
+    def paper_state(self):
+        return {"source": self.paper_source, "market": self.paper_market,
+                "recovery_enabled": self.paper_recovery_enabled, "resume_requested": self.paper_requested,
+                "recovery_status": "monitoring" if self.market_paper and self.running else
+                    "waiting" if self.paper_requested and self.paper_recovery_enabled else "idle",
+                "retry_at": serialize(self.paper_retry_at), "last_error": self.paper_last_error}
 
     def expected_history_day(self, market):
         today = market_day(market)
@@ -127,7 +157,8 @@ class Controller:
     def save(self):
         self.store.save(serialize({"settings": self.settings, "instruments": self.instruments,
             "metadata": self.metadata, "portfolios": self.portfolios, "mode": self.mode,
-            "broker_orders": self.broker_orders, "broker_order_dates": self.broker_order_dates, "events": self.events}))
+            "broker_orders": self.broker_orders, "broker_order_dates": self.broker_order_dates, "events": self.events,
+            "paper": self.paper_state()}))
 
     def broker_configured(self):
         return bool(self.broker is not None or (os.getenv("KIWOOM_APP_KEY") and os.getenv("KIWOOM_SECRET_KEY")))
@@ -148,18 +179,25 @@ class Controller:
         watchlist = []
         for key, item in self.instruments.items():
             meta = self.metadata.get(key, {})
+            if self.market_paper and meta.get("source") == "demo":
+                continue
             watchlist.append({**serialize(item), "key": key, "currency": item.currency,
+                              "current_price": serialize(item.current_price if item.current_price is not None else meta.get("last_quote_price")),
+                              "quote_asof": meta.get("last_quote_at"),
                               "threshold": serialize(item.threshold(self.settings)),
                               "history_reason": meta.get("history_reason", "가격 이력 미확인"),
                               "source": meta.get("source", "manual")})
-        positions = [{**serialize(p), "key": p.key, "currency": p.currency,
-                      "stop_price": str(p.stop_price(self.settings))} for p in self.portfolio.positions.values()]
+        valued = value_portfolio(self.portfolio, self.instruments, self.metadata, self.last_ticks,
+                                 settings=self.settings, real_market=self.mode == "live" or self.market_paper)
         # Return a bounded view, while the scanner continues across the FULL universe.
         visible = sorted(watchlist, key=lambda r: (r["key"] not in self.portfolio.positions, r["current_price"] is None, r["key"]))[:250]
         return {"settings": serialize(self.settings), "running": self.running,
             "armed": self.running and self.mode == "live", "mode": self.mode,
             "cash": {c: str(self.portfolio.available_cash(c)) for c in ("KRW", "USD")},
-            "positions": positions, "watchlist": visible, "watchlist_total": len(watchlist),
+            **valued, "paper": self.paper_state(),
+            "runtime": {"background": os.getenv("BREAKLINE_BACKGROUND") == "1"},
+            "market_sessions": {m: session_open(m) for m in self.selected_markets()},
+            "watchlist": visible, "watchlist_total": len(watchlist),
             "orders": [serialize(o) for o in list(self.portfolio.orders.values())[-200:]][::-1],
             "events": self.events[-80:][::-1], "scanner": self.scanner,
             "feeds": self.feed_status,
@@ -175,6 +213,10 @@ class Controller:
             self.instruments[key] = Instrument(market, symbol, name or symbol)
         elif name:
             self.instruments[key].name = name
+        if name:
+            for portfolio in self.portfolios.values():
+                if key in portfolio.positions:
+                    portfolio.positions[key].name = name
         self.metadata.setdefault(key, {}).update({k:v for k,v in metadata.items() if v is not None})
         return self.instruments[key]
 
@@ -195,20 +237,54 @@ class Controller:
             if price <= 0:
                 raise ValueError("시세는 0보다 커야 합니다.")
             item = self.instruments[key]
-            if self.mode == "live" and source not in {"kiwoom", "kiwoom_ws"}:
-                raise ValueError("실거래에는 입력/예제 가격을 사용할 수 없습니다.")
-            if self.mode == "live" and (not session_open(item.market) or not fresh_quote(quote)):
-                # Reset baseline; resuming after an outage requires a fresh pair.
-                item.current_price = item.previous_price = None
-                self.latest_error = f"{item.key}: 정규장 또는 최근 90초 이내 체결 시각을 확인할 수 없어 주문 차단"
-                return None
-            if source in {"kiwoom", "kiwoom_ws"} and quote and fresh_quote(quote):
-                stamp = datetime.fromisoformat(quote["market_timestamp"])
+            provider = source in {"kiwoom", "kiwoom_ws"}
+            market_prices = self.mode == "live" or self.market_paper
+            if market_prices and (not provider or self.metadata.get(key, {}).get("source") == "demo"):
+                raise ValueError("실제 시세 모의투자와 실거래에는 키움이 제공한 실제 종목·시세만 사용할 수 있습니다.")
+            if not provider and self.metadata.get(key, {}).get("source") in {"kiwoom", "csv"}:
+                raise ValueError("실제 종목의 시세를 예제 가격으로 덮어쓸 수 없습니다. 예제 종목을 사용하세요.")
+            if provider:
+                try:
+                    stamp = datetime.fromisoformat(quote["market_timestamp"])
+                    verified = quote.get("timestamp_verified") and stamp.tzinfo is not None and (utcnow()-stamp).total_seconds() >= -5
+                except (TypeError, KeyError, ValueError):
+                    verified = False
+                if not verified:
+                    item.current_price = item.previous_price = None
+                    return None
+                if market_prices and (not session_open(item.market) or not fresh_quote(quote)):
+                    # Even an out-of-order stale sample invalidates a trading
+                    # baseline. The newer durable valuation remains untouched.
+                    item.current_price = item.previous_price = None
+                durable_stamp = self.metadata.get(key, {}).get("last_quote_at")
+                if durable_stamp and self.metadata.get(key, {}).get("last_quote_verified"):
+                    try:
+                        if stamp < datetime.fromisoformat(durable_stamp):
+                            return None
+                    except (TypeError, ValueError):
+                        pass
                 if key in self.last_ticks and stamp < self.last_ticks[key]:
                     return None
                 self.last_ticks[key] = stamp
+                self.metadata.setdefault(key, {}).update(last_quote_at=stamp.isoformat(),
+                    last_quote_verified=True, last_quote_source=source, last_quote_price=str(price))
+            position = self.portfolio.positions.get(key)
+            if position:
+                position.current_price = price
+                position.name = item.name
+            if market_prices and (not session_open(item.market) or not fresh_quote(quote)):
+                # Keep the last verified mark for valuation, but never pair an
+                # old/closed-session quote with a future crossing.
+                item.current_price = item.previous_price = None
+                if self.mode == "live":
+                    self.latest_error = f"{item.key}: 정규장 또는 최근 90초 이내 체결 시각을 확인할 수 없어 주문 차단"
+                return None
+            if market_prices and source == "kiwoom" and key not in self.portfolio.positions:
+                # REST marks must not consume a crossing that should be
+                # observed on the acknowledged streaming subscription.
+                return None
             engine = Strategy(self.settings, self.portfolio)
-            if not self.running:
+            if not self.running or (self.mode == "paper" and self.paper_source == "demo" and provider):
                 item.previous_price, item.current_price = item.current_price, decimal(price)
                 return None
             if self.mode == "live":
@@ -227,6 +303,15 @@ class Controller:
             decision = engine.evaluate_tick(item, price, self.expected_history_day(item.market))
             if not decision:
                 return None
+            if market_prices and decision.side == "BUY":
+                if self.market_paper and item.market not in self.selected_markets():
+                    return None
+                if self.metadata.get(key, {}).get("history_source") not in {"provider", "csv_attested"}:
+                    return None
+                if self.metadata.get(key, {}).get("adjustment_as_of") != market_day(item.market).isoformat():
+                    return None
+                if source != "kiwoom_ws" or not self.feeds.get(item.market) or not all(f.ready for f in self.feeds.values()):
+                    return None
             if self.mode == "live":
                 # Demo/manual ATHs never enter a real-money order path.
                 if decision.side == "BUY":
@@ -270,7 +355,7 @@ class Controller:
                     decision.quantity = min(int(budget / (decision.limit_price * (1 + self.settings.fee_reserve_percent / 100))), int(funds["max_quantity"]))
                     if decision.quantity < 1:
                         return None
-            if self.mode == "live" and (not self.running or not session_open(item.market) or not fresh_quote(quote)):
+            if market_prices and (not self.running or not session_open(item.market) or not fresh_quote(quote)):
                 item.current_price = item.previous_price = None
                 self.latest_error = f"{item.key}: 주문 준비 중 시세가 만료되었거나 장이 종료되어 주문 차단"
                 return None
@@ -278,7 +363,7 @@ class Controller:
             if self.mode == "paper":
                 fee = order.limit_price * order.quantity * self.settings.fee_reserve_percent / 100
                 engine.apply_order_update(order.id, order.quantity, order.limit_price, "filled", cumulative_fee=fee)
-                self.event("info", f"가상 체결 {item.key} {order.side} {order.quantity}주 @ {order.limit_price}")
+                self.event("info", f"가상 체결 {item.name} ({item.key}) {order.side} {order.quantity}주 @ {order.limit_price}")
             else:
                 # Persist uncertain intent BEFORE the network. Never retry an order.
                 order.status = "unknown"
@@ -359,18 +444,30 @@ class Controller:
         self.event("info", "키움 주문/체결·잔고 동기화를 마쳤습니다.")
         self.save()
 
-    async def start(self, mode, confirmation=""):
+    async def start(self, mode, confirmation="", *, paper_source=None, market=None, recovery_enabled=None,
+                    _recovery_generation=None):
         async with self.lock:
+            if _recovery_generation is not None and (self.closing or not self.market_paper
+                    or not self.paper_requested or self.paper_generation != _recovery_generation):
+                return False
             if self.stopping or (self.worker_task and not self.worker_task.done()):
                 raise ValueError("기존 실행이 정지될 때까지 기다리세요.")
             if self.running:
                 raise ValueError("이미 실행 중입니다.")
             if mode not in {"paper", "live"}:
                 raise ValueError("실행 모드를 확인하세요.")
+            source = self.paper_source if paper_source is None else paper_source
+            selected_market = self.paper_market if market is None else market
+            if source not in {"market", "demo"} or selected_market not in {"ALL", "KR", "US"}:
+                raise ValueError("모의 시세 종류와 시장을 확인하세요.")
+            if recovery_enabled is not None and not isinstance(recovery_enabled, bool):
+                raise ValueError("자동 복구 여부를 확인하세요.")
             if self.scan_task and not self.scan_task.done():
                 raise ValueError("검색을 정지한 뒤 모드를 전환하세요.")
             if mode == "paper" and any(o.status in OPEN_STATUSES for o in self.portfolios["live"].orders.values()):
                 raise ValueError("실계좌 미체결/응답 불명 주문을 동기화·취소한 뒤 모의 실행으로 전환하세요.")
+            if mode == "paper" and source == "market":
+                self.get_broker()  # Validate configuration without reading real account funds.
             if mode == "live":
                 if os.getenv("ALLOW_LIVE_TRADING", "false").lower() != "true" or confirmation != "실거래 시작":
                     raise ValueError("ALLOW_LIVE_TRADING=true 설정과 '실거래 시작' 확인 문구가 필요합니다.")
@@ -402,6 +499,13 @@ class Controller:
                     funds = await broker.cash(market)
                     target.cash[funds["currency"]] = decimal(funds["available_cash"])
             self.mode = mode
+            if mode == "paper":
+                self.paper_source = source
+                self.paper_market = selected_market
+                if recovery_enabled is not None:
+                    self.paper_recovery_enabled = recovery_enabled
+            self.paper_requested = self.market_paper and self.paper_recovery_enabled
+            self.paper_retry_at = None
             for item in self.instruments.values():
                 item.current_price = item.previous_price = None
             self.last_ticks = {}
@@ -409,16 +513,24 @@ class Controller:
             self.latest_error = None
             self.running = True
             self.scan_enabled = True
-            self.event("info", "실거래 시작: 계좌 동기화 완료. 첫 시세는 돌파 판단의 기준으로만 사용합니다." if mode == "live" else "모의 실행 시작. 실제 주문을 전송하지 않습니다.")
+            self.event("info", "실거래 시작: 계좌 동기화 완료. 첫 시세는 돌파 판단의 기준으로만 사용합니다." if mode == "live" else
+                "실제 시세 모의투자 시작: 키움 시세와 가상 현금으로 정수 수량을 계산합니다. 주문은 가상 체결합니다." if self.market_paper else
+                "예제 연습 시작. 입력한 가상 가격으로 규칙을 확인합니다.")
             self.save()
         self.worker_task = asyncio.create_task(self.worker())
+        return True
 
-    async def stop(self):
+    async def stop(self, *, preserve_paper_request=False):
+        if not preserve_paper_request:
+            self.paper_generation += 1
+            self.paper_requested = False
+            self.paper_retry_at = None
         self.stopping = True
         self.running = False
         self.scan_enabled = False
         self.scanner["status"] = "idle"
-        self.event("info", "자동매매 정지. 이미 접수한 키움 미체결 주문은 취소 버튼 또는 키움에서 별도로 확인하세요. 정지 중에는 손절도 실행하지 않습니다.")
+        self.event("info", "자동매매 정지. 이미 접수한 키움 미체결 주문은 취소 버튼 또는 키움에서 별도로 확인하세요. 정지 중에는 손절도 실행하지 않습니다." if self.mode == "live" else
+                   "모의 감시 정지. 가상 잔고와 주문 기록은 보관되며, 정지 중에는 가상 주문과 손절이 실행되지 않습니다.")
         if self.worker_task and self.worker_task is not asyncio.current_task():
             # Let any in-flight order resolve before changing modes or reporting stop.
             await self.worker_task
@@ -428,35 +540,82 @@ class Controller:
         self.stopping = False
         self.save()
 
+    def schedule_paper_retry(self, message):
+        if not (self.market_paper and self.paper_requested and self.paper_recovery_enabled):
+            return
+        delay = min(300, 10 * (2 ** min(self.paper_retry_count, 5)))
+        self.paper_retry_count += 1
+        self.paper_retry_at = utcnow() + timedelta(seconds=delay)
+        self.paper_last_error = str(message)
+        self.event("warning", f"모의 감시 일시 중지: {delay}초 뒤 연결과 이력을 다시 확인합니다. {message}")
+
+    async def recover_paper_once(self):
+        """Resume only explicitly requested real-market virtual trading."""
+        if (self.closing or not self.market_paper or not self.paper_requested
+                or not self.paper_recovery_enabled or self.running or self.stopping):
+            return False
+        if self.paper_retry_at and utcnow() < self.paper_retry_at:
+            return False
+        if self.worker_task and not self.worker_task.done():
+            return False
+        generation = self.paper_generation
+        try:
+            await self.stop(preserve_paper_request=True)
+            if self.closing or not self.paper_requested:
+                return False
+            return await self.start("paper", paper_source="market", market=self.paper_market,
+                                    recovery_enabled=True, _recovery_generation=generation)
+        except Exception as exc:
+            self.latest_error = str(exc)
+            self.schedule_paper_retry(exc)
+            self.save()
+            return False
+
+    async def recovery_loop(self):
+        while not self.closing:
+            await self.recover_paper_once()
+            await asyncio.sleep(1)
+
+    def start_recovery(self):
+        if self.recovery_task is None or self.recovery_task.done():
+            self.recovery_task = asyncio.create_task(self.recovery_loop())
+
     async def worker(self):
         while self.running:
             try:
+                market_data = self.mode == "live" or self.market_paper
                 if self.mode == "live":
                     await self.reconcile()
                 keys = list(self.portfolio.positions)
-                if self.settings.universe_mode == "watchlist":
-                    keys += [k for k in self.instruments if k not in keys]
+                # Discovery supplies exchange metadata before subscribing to
+                # unheld watchlist symbols. REST polling here is for holdings;
+                # otherwise a newly added US symbol can fail before discovery.
                 for key in keys:
                     if not self.running:
                         break
-                    if not self.broker_configured() or (self.metadata.get(key, {}).get("source") == "demo" and self.mode == "paper"):
+                    if not market_data or not self.broker_configured() or self.metadata.get(key, {}).get("source") == "demo":
                         continue
                     quote = await self.get_broker().quote(self.broker_instrument(key))
                     await self.tick(key, quote["price"], source="kiwoom", quote=quote)
-                if self.settings.universe_mode == "all" and self.scan_enabled and self.broker_configured():
+                if market_data and self.scan_enabled and self.broker_configured():
                     if not self.scan_task or self.scan_task.done():
                         if self.scanner["status"] == "error":
                             raise ValueError(self.scanner["last_error"] or "전체 시장 검색 오류")
                         # Daily discovery/history update; fresh ticks use streams.
-                        days = {m: market_day(m).isoformat() for m in ("KR", "US")}
+                        days = {m: market_day(m).isoformat() for m in self.selected_markets()}
                         if getattr(self, "last_scan_days", None) != days:
-                            await self.begin_scan("ALL")
-                elif self.settings.universe_mode == "watchlist" and self.broker_configured() and not self.feeds:
-                    await self.start_feeds()
+                            await self.begin_scan(self.paper_market if self.market_paper else "ALL")
+                if market_data:
+                    # Periodic durable marks avoid a database write for every
+                    # market tick while preserving the most recent valuation.
+                    self.save()
             except Exception as exc:
                 self.latest_error = str(exc)
                 self.event("error", f"자동매매 정지: {self.latest_error}")
                 self.running = False
+                self.scan_enabled = False
+                self.scanner["status"] = "idle"
+                self.schedule_paper_retry(self.latest_error)
                 self.save()
                 break
             # Short waits allow the stop action to finish promptly.
@@ -488,6 +647,8 @@ class Controller:
             for key, item in self.instruments.items():
                 if item.market != market or self.metadata.get(key, {}).get("source") == "demo":
                     continue
+                if self.market_paper and market not in self.selected_markets() and key not in self.portfolio.positions:
+                    continue
                 valid = (item.history_verified and item.history_through == previous_session(market)
                          and self.metadata.get(key, {}).get("adjustment_as_of") == market_day(market).isoformat())
                 if key in self.portfolio.positions or valid:
@@ -512,6 +673,7 @@ class Controller:
                 for item in self.instruments.values():
                     item.current_price = item.previous_price = None
                 self.event("error", self.latest_error)
+                self.schedule_paper_retry(self.latest_error)
                 self.save()
 
         async def feed_runner(feed):
@@ -532,6 +694,11 @@ class Controller:
                                 item.current_price = item.previous_price = None
                                 self.last_ticks.pop(item.key, None)
                         self.event("info", f"{selected_market} 실시간 구독 승인 완료. 새 첫 시세는 기준으로만 사용합니다.")
+                        if self.market_paper and all(f.ready for f in self.feeds.values()):
+                            self.paper_retry_count = 0
+                            self.paper_retry_at = None
+                            self.paper_last_error = None
+                            self.latest_error = None
                     self.save()
             self.feeds[market] = KiwoomStream(self.get_broker(), market, rows, quote_received, gap, status_changed)
         for market, feed in self.feeds.items():
@@ -543,6 +710,9 @@ class Controller:
             markets = ("KR", "US") if market == "ALL" else (market,)
             if self.broker_configured():
                 universe = await self.get_broker().universe(markets=markets)
+                if self.settings.universe_mode == "watchlist":
+                    wanted = set(self.instruments) | set(self.portfolio.positions)
+                    universe = [row for row in universe if f"{row['market']}:{row['symbol']}" in wanted]
                 source = "kiwoom"
                 coverage = "키움 공식 종목 목록. 시세 권한·거래소 및 이력 검증 통과 여부를 별도로 확인하세요."
             else:
@@ -559,12 +729,13 @@ class Controller:
                 async with self.lock:
                     item = self.add(row["market"], row["symbol"], row.get("name", ""), **{k:v for k,v in row.items() if k not in {"market", "symbol", "name"}})
                     if source == "kiwoom":
-                        if self.metadata[item.key].get("source") not in {"csv", "demo"}:
+                        if self.metadata[item.key].get("source") != "csv":
                             self.metadata[item.key]["source"] = "kiwoom"
                 try:
                     if source == "kiwoom":
                         day = market_day(item.market).isoformat()
-                        if (item.history_through != previous_session(item.market) or not item.history_verified
+                        if (self.metadata[item.key].get("history_source") not in {"provider", "csv_attested"}
+                                or item.history_through != previous_session(item.market) or not item.history_verified
                                 or self.metadata[item.key].get("adjustment_as_of") != day):
                             history = await self.get_broker().history(self.broker_instrument(item.key), market_day(item.market))
                             computed = await asyncio.to_thread(compute_history, history.get("bars", []), item.market,
@@ -607,6 +778,8 @@ class Controller:
             if self.running:
                 self.latest_error = f"전체 시장 검색 중단: {exc}"
                 self.running = False
+                self.scan_enabled = False
+                self.schedule_paper_retry(self.latest_error)
             self.save()
 
     async def begin_scan(self, market):
@@ -624,6 +797,9 @@ class Controller:
         if any(o.status in OPEN_STATUSES for o in self.portfolios["live"].orders.values()):
             raise ValueError("미체결 실주문을 확인한 뒤 예제를 초기화하세요.")
         self.mode = "paper"
+        self.paper_source = "demo"
+        self.paper_requested = False
+        self.paper_retry_at = None
         self.portfolios["paper"] = Portfolio(cash={"KRW": Decimal("10000000"), "USD": Decimal("10000")})
         # Preserve all user universe data. Only the reserved DEMO symbols are reset.
         for market, symbol, name, high in (("KR", "000000", "국내 규칙 예제 (가상)", "10000"), ("US", "DEMO", "미국 규칙 예제 (가상)", "100")):
@@ -637,9 +813,29 @@ class Controller:
         self.event("info", "모의 포트폴리오 초기화: 가상 KRW 1,000만 원 / USD 1만 달러. 실제 계좌와 무관합니다.")
         self.save()
 
+    def reset_market_paper(self, cash_krw, cash_usd, confirmation):
+        if self.running or self.stopping or (self.scan_task and not self.scan_task.done()):
+            raise ValueError("감시와 검색을 정지한 뒤 모의 자금을 초기화하세요.")
+        if self.mode == "live" or confirmation != "모의투자 초기화":
+            raise ValueError("모의 거래 모드에서 '모의투자 초기화'를 확인하세요.")
+        krw, usd = decimal(cash_krw), decimal(cash_usd)
+        if krw < 0 or usd < 0 or krw + usd <= 0:
+            raise ValueError("가상 자금은 0 이상이며 한 통화 이상에 자금이 있어야 합니다.")
+        self.portfolios["market_paper"] = Portfolio(cash={"KRW": krw, "USD": usd})
+        self.paper_source = "market"
+        self.paper_requested = False
+        self.paper_retry_at = None
+        self.event("info", f"실제 시세 모의투자 장부 초기화: 가상 KRW {krw} / USD {usd}")
+        self.save()
+
     async def close(self):
+        self.closing = True
+        if self.recovery_task and self.recovery_task is not asyncio.current_task():
+            self.recovery_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.recovery_task
         # Stop before closing storage; never cancel an order submission task.
-        await self.stop()
+        await self.stop(preserve_paper_request=True)
         if self.scan_task and not self.scan_task.done():
             self.scan_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -667,6 +863,15 @@ class AddInstrument(StrictModel):
 class StartRequest(StrictModel):
     mode: str = "paper"
     confirmation: str = ""
+    paper_source: str | None = None
+    market: str | None = None
+    recovery_enabled: bool | None = None
+
+
+class PaperReset(StrictModel):
+    cash_krw: str = "10000000"
+    cash_usd: str = "10000"
+    confirmation: str
 
 
 class TickRequest(StrictModel):
@@ -692,6 +897,7 @@ def create_app(directory=None, broker=None):
     @asynccontextmanager
     async def lifespan(app):
         app.state.controller = Controller(directory, broker)
+        app.state.controller.start_recovery()
         try:
             yield
         finally:
@@ -784,8 +990,8 @@ def create_app(directory=None, broker=None):
         c = controller(request)
         if key not in c.instruments:
             raise HTTPException(404, "종목이 없습니다.")
-        if c.mode != "paper":
-            raise ValueError("직접 가격 입력은 모의 실행에서만 가능합니다.")
+        if c.mode != "paper" or c.paper_source != "demo":
+            raise ValueError("직접 가격 입력은 예제 연습에서만 가능합니다.")
         await c.tick(key, body.price)
         return c.state()
 
@@ -793,10 +999,12 @@ def create_app(directory=None, broker=None):
     async def manual_history(request: Request, key: str, body: ManualHistory):
         c = controller(request)
         async with c.lock:
-            if c.mode != "paper" or c.running:
-                raise ValueError("수동 기준가 입력은 정지된 모의 실행에서만 가능합니다.")
+            if c.mode != "paper" or c.paper_source != "demo" or c.running:
+                raise ValueError("수동 기준가 입력은 정지된 예제 연습에서만 가능합니다.")
             if key not in c.instruments:
                 raise HTTPException(404, "종목이 없습니다.")
+            if c.metadata.get(key, {}).get("source") in {"kiwoom", "csv"} or key in c.portfolios["market_paper"].positions:
+                raise ValueError("실제 종목의 가격 이력을 예제로 바꿀 수 없습니다. 예제 종목을 사용하세요.")
             high = decimal(body.all_time_high)
             if high <= 0 or not body.confirmed_adjusted_complete:
                 raise ValueError("양수 가격과 이력 확인이 필요합니다.")
@@ -812,7 +1020,8 @@ def create_app(directory=None, broker=None):
     @app.post("/api/engine/start")
     async def start(request: Request, body: StartRequest):
         c = controller(request)
-        await c.start(body.mode, body.confirmation)
+        await c.start(body.mode, body.confirmation, paper_source=body.paper_source,
+                      market=body.market, recovery_enabled=body.recovery_enabled)
         return c.state()
 
     @app.post("/api/engine/stop")
@@ -901,10 +1110,17 @@ def create_app(directory=None, broker=None):
             c.reset_demo()
             return c.state()
 
+    @app.post("/api/paper/reset")
+    async def reset_paper(request: Request, body: PaperReset):
+        c = controller(request)
+        async with c.lock:
+            c.reset_market_paper(body.cash_krw, body.cash_usd, body.confirmation)
+            return c.state()
+
     @app.post("/api/demo/scenario")
     async def demo(request: Request):
         c = controller(request)
-        if not c.running or c.mode != "paper":
+        if not c.running or c.mode != "paper" or c.paper_source != "demo":
             raise ValueError("예제 초기화 후 모의 실행을 시작하세요.")
         for key in ("KR:000000", "US:DEMO"):
             if key not in c.instruments:

@@ -303,6 +303,7 @@ class AppTests(unittest.TestCase):
         broker = UnknownBroker()
         with patch.dict(os.environ, {"ALLOW_LIVE_TRADING": "true", "KIWOOM_ENV": "live"}):
             with self.client(broker=broker) as client:
+                self.assertEqual(self.post(client, "/api/demo/reset").status_code, 200)
                 self.post(client, "/api/watchlist", {"market": "KR", "symbol": "000001", "name": "Synthetic"})
                 history = {"all_time_high": "10000", "history_through": previous_session("KR").isoformat(), "confirmed_adjusted_complete": True}
                 self.assertEqual(self.post(client, "/api/watchlist/KR:000001/history", history).status_code, 200)
@@ -315,14 +316,16 @@ class AppTests(unittest.TestCase):
                 c.feeds["KR"] = ReadyFeed()
                 quote = {"timestamp_verified": True, "market_timestamp": datetime.now(timezone.utc).isoformat()}
                 with patch("app.main.session_open", return_value=True):
-                    client.portal.call(partial(c.tick, "KR:000001", "10100", source="kiwoom_ws", quote=quote))
-                    client.portal.call(partial(c.tick, "KR:000001", "10200", source="kiwoom_ws", quote=quote))
+                    for price in ("10100", "10200"):
+                        with self.assertRaisesRegex(ValueError, "실제 종목"):
+                            client.portal.call(partial(c.tick, "KR:000001", price, source="kiwoom_ws", quote=quote))
                 state = client.get("/api/state").json()
                 self.assertEqual(state["orders"], [])
                 self.assertEqual(broker.submissions, 0)
 
     def test_start_is_blocked_until_stopping_worker_finishes(self):
         with self.client() as client:
+            self.assertEqual(self.post(client, "/api/demo/reset").status_code, 200)
             c = client.app.state.controller
             original_worker = c.worker
 

@@ -10,3 +10,4 @@ data/
 .coverage
 playwright-report/
 test-results/
+.runtime/

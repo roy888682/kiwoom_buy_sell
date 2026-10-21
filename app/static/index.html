@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>Breakline · 원칙으로 움직이는 투자</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%23162735'/%3E%3Cpath d='M10 27V11m0 11c0-9 15-9 15 0s-15 9-15 0m11-10h10v10m-1-9L20 23' fill='none' stroke='%23d7f4ba' stroke-width='3'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/static/style.css?v=20261020-sections80">
-  <script src="/static/app.js?v=20261020-sync-recovery" defer></script>
+  <link rel="stylesheet" href="/static/style.css?v=20261021-market-paper">
+  <script src="/static/app.js?v=20261021-market-paper" defer></script>
 </head>
 <body>
   <aside class="sidebar">
@@ -32,26 +32,35 @@
       <div id="global-message" class="notice" role="status" aria-live="polite" hidden></div>
       <div id="live-notice" class="notice notice-warning" hidden>키움 연결 거래는 별도 활성화와 API 키가 필요합니다. 거래 가능 시장과 데이터 이력 범위를 먼저 확인하세요.</div>
 
-      <section class="panel demo-quickstart" aria-labelledby="demo-quickstart-title">
-        <div class="quickstart-heading"><div><p class="section-kicker">PAPER TRADING QUICK START</p><h2 id="demo-quickstart-title">처음 사용하시나요? 모의 거래 시작</h2></div><span class="tag tag-teal">실제 주문 없는 연습</span></div>
-        <div class="quickstart-actions"><button class="button button-teal" id="demo-reset" type="button" aria-describedby="demo-reset-hint">샘플 초기화</button><button class="button button-dark" id="demo-scenario" type="button">돌파 시나리오 실행 ↗</button></div>
-        <ol class="quickstart-steps">
-          <li><strong>샘플 초기화</strong><span>위 버튼으로 가상 현금과 예제 종목을 준비하세요.</span></li>
-          <li><strong>모의 거래 선택 → 감시 시작</strong><span>화면 위쪽 실행 모드를 ‘모의 거래’로 선택하고 ‘감시 시작’을 누르세요.</span></li>
-          <li><strong>돌파 시나리오 실행</strong><span>위 버튼으로 가격 돌파를 재현한 뒤 주문 내역을 확인하세요.</span></li>
-        </ol>
-        <p class="quickstart-hint" id="demo-reset-hint" role="status">샘플 초기화는 감시와 시장 탐색을 멈춘 상태에서 실행할 수 있습니다.</p>
+      <section class="panel paper-quickstart" aria-labelledby="paper-quickstart-title">
+        <div class="quickstart-heading"><div><p class="section-kicker">REAL MARKET · VIRTUAL MONEY</p><h2 id="paper-quickstart-title">실제 시세로 모의투자</h2></div><span class="tag tag-teal" id="paper-source-badge">가상 자금 · 실제 주문 없음</span></div>
+        <p class="section-description">실제 종목과 공식 시세로 매수·손절을 연습합니다. 위의 ‘감시 시작’을 누르면 선택한 시장의 이력과 시세 연결을 확인합니다.</p>
+        <div class="paper-options">
+          <label for="paper-source"><span>시세 선택</span><select id="paper-source"><option value="market">실제 시세 모의투자</option><option value="demo">예제 가격 연습</option></select></label>
+          <label for="paper-market"><span>투자 시장</span><select id="paper-market"><option value="ALL">국내 + 미국</option><option value="KR">국내 주식 · ETF</option><option value="US">미국 주식 · ETF</option></select></label>
+          <label class="recovery-option" for="paper-recovery"><input id="paper-recovery" type="checkbox" checked><span>연결 복구 후 자동으로 다시 감시<small>실제 시세 모의투자에만 적용</small></span></label>
+        </div>
+        <div class="paper-status" id="paper-status" role="status" aria-live="polite">시세 연결 상태를 확인하는 중입니다.</div>
+        <div class="market-session-row" id="market-sessions" aria-label="시장 운영 시간"></div>
+        <div class="paper-guide"><p><strong>‘국내 + 미국’은 탐색할 시장입니다.</strong> 전체 종목이 준비되었다는 뜻은 아닙니다. 아래 ‘시장 탐색’의 등록 종목 수·이력 검증·구독 승인 상태를 확인하세요.</p><button id="paper-reset" type="button" class="button button-quiet">모의 자금 설정 · 초기화</button></div>
+        <details class="background-guide"><summary>브라우저를 닫아도 계속 감시하려면</summary><p id="background-status">프로그램 실행 방식을 확인하고 있습니다.</p><ol><li>프로그램 폴더에서 <code>start-background.bat</code>을 실행하세요.</li><li>이 화면에서 ‘감시 시작’을 누르세요. 브라우저만 닫아도 프로그램은 계속 실행됩니다.</li><li>컴퓨터 전원과 인터넷을 유지하고 절전·최대 절전 모드를 끄세요. 전원이 꺼지거나 절전 상태이면 감시할 수 없습니다.</li><li>프로그램까지 종료할 때는 <code>stop-background.bat</code>을 실행하세요.</li></ol><p>장 운영 시간에 시세를 감시하고, 연결이 끊기면 선택한 자동 복구 설정에 따라 재시도합니다.</p></details>
       </section>
 
+      <section class="valuation-grid" id="valuation-content" aria-label="통화별 자산 평가">
+        <article class="valuation-card" id="valuation-krw"><div class="valuation-heading"><h2>국내 자산 <span>KRW · 원화</span></h2><span class="tag" id="valuation-status-krw">확인 중</span></div><p class="asset-label">총자산 <small>현금 잔액 + 주식 평가금액</small></p><strong class="asset-total" id="total-assets-krw">—</strong><dl class="valuation-metrics"><div><dt>주식 평가금액</dt><dd id="market-value-krw">—</dd></div><div><dt>매입금액</dt><dd id="cost-basis-krw">—</dd></div><div><dt>평가손익</dt><dd id="unrealized-pnl-krw">—</dd></div><div><dt>수익률</dt><dd id="return-percent-krw">—</dd></div><div><dt>현금 잔액</dt><dd id="cash-balance-krw">—</dd></div><div><dt>주문 가능 현금</dt><dd id="cash-krw">—</dd></div></dl><p class="valuation-note" id="valuation-note-krw"></p></article>
+        <article class="valuation-card" id="valuation-usd"><div class="valuation-heading"><h2>미국 자산 <span>USD · 달러</span></h2><span class="tag" id="valuation-status-usd">확인 중</span></div><p class="asset-label">총자산 <small>현금 잔액 + 주식 평가금액</small></p><strong class="asset-total" id="total-assets-usd">—</strong><dl class="valuation-metrics"><div><dt>주식 평가금액</dt><dd id="market-value-usd">—</dd></div><div><dt>매입금액</dt><dd id="cost-basis-usd">—</dd></div><div><dt>평가손익</dt><dd id="unrealized-pnl-usd">—</dd></div><div><dt>수익률</dt><dd id="return-percent-usd">—</dd></div><div><dt>현금 잔액</dt><dd id="cash-balance-usd">—</dd></div><div><dt>주문 가능 현금</dt><dd id="cash-usd">—</dd></div></dl><p class="valuation-note" id="valuation-note-usd"></p></article>
+      </section>
+      <p class="valuation-explanation">평가금액은 수량 × 최근 확인 가격, 평가손익은 평가금액 − 매입금액입니다. 수수료·세금은 평가손익에서 제외합니다. 원화와 달러는 환산하지 않고 따로 표시합니다.</p>
+
       <section class="summary-grid" aria-label="계좌 요약">
-        <article class="summary-card summary-primary"><div class="summary-label">국내 주문 가능 현금 <span>KRW</span></div><div class="summary-value" id="cash-krw">—</div><p>수수료 · 미체결 예약 금액 반영</p><svg class="summary-decoration" viewBox="0 0 130 65" aria-hidden="true"><path d="M0 60 L24 44 L40 51 L63 25 L78 34 L103 10 L130 0"/></svg></article>
-        <article class="summary-card"><div class="summary-label">미국 주문 가능 현금 <span>USD</span></div><div class="summary-value" id="cash-usd">—</div><p>원화와 분리된 달러 잔액</p></article>
         <article class="summary-card"><div class="summary-label">현재 보유 종목 <span>PORTFOLIO</span></div><div class="summary-value"><span id="position-count">—</span><small id="max-position-count"> / — 종목</small></div><p id="portfolio-caption">정해진 최대 보유 수 안에서 투자</p></article>
         <article class="summary-card"><div class="summary-label">나의 매매 원칙 <span>STRATEGY</span></div><div class="strategy-summary"><span><small>돌파</small><b id="summary-breakout">—</b></span><span><small>매입</small><b id="summary-allocation">—</b></span><span><small>손절</small><b id="summary-stop">—</b></span></div><p>설정한 숫자로 일관되게</p></article>
       </section>
 
       <div class="dashboard-grid">
         <div class="main-column">
+          <section class="panel" id="portfolio"><div class="panel-heading"><div><p class="section-kicker">MY PORTFOLIO</p><h2>보유 종목 <span class="tag" id="portfolio-source">가상 자금</span></h2></div><span class="muted-status">시세 시각 · 한국시간 KST</span></div><p class="section-description">실제 종목명과 코드, 보유 수량, 평가금액을 확인하세요. 오래된 가격이나 시세가 없는 종목은 따로 표시합니다.</p><div class="table-wrap"><table class="positions-table"><thead><tr><th>종목명 · 코드</th><th class="numeric">보유 수량</th><th class="numeric">평균 매수가</th><th class="numeric">현재가 · 시세 시각</th><th class="numeric">평가금액</th><th class="numeric">평가손익 · 수익률</th><th class="numeric">손절 기준</th></tr></thead><tbody id="positions-content"></tbody></table></div><div class="empty-state" id="positions-empty">아직 보유한 종목이 없습니다. 감시 중 돌파 기준이 충족되면 가상 매수가 기록됩니다.</div><div id="account-sync-row" hidden><button id="account-sync" class="text-button">↻ 실계좌 · 체결 내역 동기화</button><p class="section-description">정지 상태에서만 가능합니다. 다시 시작하기 전에 계좌 상태를 확인하세요.</p></div></section>
+
           <section class="panel scanner-panel" id="scanner">
             <div class="panel-heading"><div><p class="section-kicker">MARKET SCANNER</p><h2>전체 시장 탐색 <span class="tag tag-teal">자동 검색</span></h2></div><span id="scanner-status" class="muted-status">대기 중</span></div>
             <p class="section-description">일봉 이력으로 전 거래일까지의 상장 이후 최고가를 계산한 뒤, 공식 실시간 시세로 돌파를 감시합니다.</p>
@@ -61,7 +70,7 @@
             <p class="coverage-note" id="coverage-note">전체 시장 데이터 확보 여부를 확인하세요. 모의 샘플은 전체 시장을 의미하지 않습니다.</p>
             <div class="feed-heading"><strong>실시간 시세 구독</strong><span>키움 공식 WebSocket</span></div>
             <div class="feed-grid" id="feeds-content" aria-live="polite"></div>
-            <p class="feed-note">이력 조회 완료와 실시간 감시 준비는 별도입니다. 전체 시장 실거래는 요청한 구독이 모두 승인되고 새 시세가 확인되어야 매수합니다.</p>
+            <p class="feed-note">이력 조회 완료와 실시간 감시 준비는 별도입니다. 실제 시세 모의투자와 실거래는 요청한 구독이 모두 승인되고 새 시세가 확인되어야 매수합니다.</p>
             <details class="data-import"><summary>데이터가 필요한가요? 종목 · 수정주가 이력 CSV 가져오기 <span>＋</span></summary><form id="universe-form"><label for="universe-file">상장 이후 수정 일봉 CSV · 위에서 국내 또는 미국을 선택하세요</label><div class="file-row"><input type="file" id="universe-file" accept=".csv,text/csv" required><button class="button button-quiet" type="submit">가져오기</button></div><p>열: market, symbol, name, date, high, close, adjusted, complete_from_listing<br>상장 이후 전체 이력에 한해 adjusted=true, complete_from_listing=true로 표시하세요. 현재 거래일 데이터는 최고가 계산에서 제외됩니다.</p></form></details>
           </section>
 
@@ -72,9 +81,11 @@
             <div class="watchlist" id="watchlist-content"><div class="empty-state">감시 종목을 불러오는 중입니다.</div></div>
           </section>
 
-          <section class="panel" id="portfolio"><div class="panel-heading"><div><p class="section-kicker">MY PORTFOLIO</p><h2>보유 종목</h2></div><span class="tag">실제 체결 평균가 기준</span></div><div class="table-wrap"><table><thead><tr><th>종목</th><th class="numeric">수량</th><th class="numeric">평균 매수가</th><th class="numeric">현재가</th><th class="numeric">손절 기준</th></tr></thead><tbody id="positions-content"></tbody></table></div><div class="empty-state" id="positions-empty">아직 보유한 종목이 없습니다.</div><div id="account-sync-row" hidden><button id="account-sync" class="text-button">↻ 실계좌 · 체결 내역 동기화</button><p class="section-description">정지 상태에서만 가능합니다. 다시 시작하기 전에 계좌 상태를 확인하세요.</p></div></section>
+
 
           <section class="panel" id="orders"><div class="panel-heading"><div><p class="section-kicker">ORDER HISTORY</p><h2>주문 내역</h2></div><span class="muted-status">최근 주문순</span></div><div class="table-wrap"><table><thead><tr><th>시간 · 종목</th><th>구분</th><th class="numeric">수량 / 체결</th><th class="numeric">주문가</th><th>상태</th></tr></thead><tbody id="orders-content"></tbody></table></div><div class="empty-state" id="orders-empty">주문이 발생하면 이곳에 표시됩니다.</div></section>
+
+          <section class="panel demo-quickstart" aria-labelledby="demo-quickstart-title"><div class="panel-heading"><div><p class="section-kicker">OPTIONAL · SAMPLE PRACTICE</p><h2 id="demo-quickstart-title">버튼 사용법만 연습하기</h2></div><span class="tag">실제 시세 아님</span></div><p class="section-description">예제 가격으로 매수 과정을 재현합니다. 실제 시세 모의투자의 가상 자금·보유·주문은 별도로 보존됩니다.</p><div class="quickstart-actions"><button class="button button-teal" id="demo-reset" type="button" aria-describedby="demo-reset-hint">샘플 초기화</button><button class="button button-dark" id="demo-scenario" type="button">돌파 시나리오 실행 ↗</button></div><p class="quickstart-hint" id="demo-reset-hint" role="status">샘플 초기화 → 위의 감시 시작 → 돌파 시나리오 실행 순서로 연습하세요.</p></section>
 
           <section class="panel events-panel"><div class="panel-heading"><h2>활동 기록</h2><span class="live-label"><i></i> LIVE LOG</span></div><div id="events-content" class="events-list"><p class="empty-state">새로운 활동을 기다립니다.</p></div></section>
         </div>

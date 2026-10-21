@@ -152,6 +152,73 @@ class DashboardBrowserTests(unittest.TestCase):
         expect(self.page.locator("#last-updated")).to_have_text("최근 동기화 2026-01-02 01:02:06 KST")
         self.assertEqual(self.errors, [])
 
+    def test_real_market_options_survive_poll_and_missing_keys_are_actionable(self):
+        expect(self.page.locator("#paper-source")).to_have_value("market")
+        expect(self.page.locator("#paper-market")).to_have_value("ALL")
+        self.page.locator("#paper-market").select_option("KR")
+        self.page.locator("#paper-recovery").uncheck()
+        self.next_poll()
+        expect(self.page.locator("#paper-market")).to_have_value("KR")
+        expect(self.page.locator("#paper-recovery")).not_to_be_checked()
+        with self.page.expect_request("**/api/engine/start") as pending:
+            self.page.locator("#start-engine").click()
+        body = pending.value.post_data_json
+        self.assertEqual(body["paper_source"], "market")
+        self.assertEqual(body["market"], "KR")
+        self.assertFalse(body["recovery_enabled"])
+        expect(self.page.locator("#toast")).to_contain_text("키")
+        self.assertFalse(self.get_json("/api/state")["running"])
+        self.assertEqual(self.get_json("/api/state")["orders"], [])
+        self.assertEqual(self.errors, [])
+
+    def test_virtual_cash_reset_and_separate_currency_totals(self):
+        self.page.locator("#paper-reset").click()
+        self.page.locator('[name="cash_krw"]').fill("2000000")
+        self.page.locator('[name="cash_usd"]').fill("1500.25")
+        self.page.locator('[name="confirmation"]').fill("모의투자 초기화")
+        self.page.locator("#dialog-submit").click()
+        expect(self.page.locator("#input-dialog")).not_to_be_visible()
+        expect(self.page.locator("#total-assets-krw")).to_have_text("₩2,000,000")
+        expect(self.page.locator("#total-assets-usd")).to_contain_text("1,500.25")
+        state = self.get_json("/api/state")
+        self.assertEqual(state["valuation"]["KRW"]["total_assets"], "2000000")
+        self.assertEqual(state["paper"]["source"], "market")
+        self.assertEqual(self.errors, [])
+
+    def test_holdings_price_age_unknown_totals_and_background_recovery_display(self):
+        # Rendering fixture only; actual valuation arithmetic is tested against
+        # the ledger in test_valuation and market quotes in test_market_paper.
+        state = self.get_json("/api/state")
+        state["runtime"] = {"background": True}
+        state["paper"].update(resume_requested=True, recovery_status="waiting",
+                              last_error="검증용 연결 중단", retry_at="2026-01-01T16:03:00+00:00")
+        state["positions"] = [{"market": "KR", "symbol": "005930", "name": "삼성전자",
+            "currency": "KRW", "quantity": 12, "average_price": "70000", "current_price": "72000",
+            "market_value": "864000", "unrealized_pnl": "24000", "return_percent": "2.857142",
+            "stop_price": "66500", "quote_asof": "2026-01-01T15:00:00+00:00", "valuation_status": "stale"}]
+        state["valuation"]["KRW"].update(market_value="864000", cost_basis="840000",
+            unrealized_pnl="24000", return_percent="2.857142", total_assets="10024000",
+            stale_positions=1, valuation_status="stale")
+        state["valuation"]["USD"].update(market_value=None, total_assets=None,
+            unrealized_pnl=None, return_percent=None, known_market_value="200", unpriced_positions=1,
+            valuation_status="unavailable")
+        self.page.route("**/api/state", lambda route: route.fulfill(json=state))
+        self.next_poll()
+        expect(self.page.locator("#positions-content")).to_contain_text("삼성전자")
+        expect(self.page.locator("#positions-content")).to_contain_text("12주")
+        expect(self.page.locator("#positions-content")).to_contain_text("₩864,000")
+        expect(self.page.locator("#positions-content")).to_contain_text("오래된 시세")
+        expect(self.page.locator("#total-assets-usd")).to_have_text("—")
+        expect(self.page.locator("#valuation-note-usd")).to_contain_text("확정할 수 없습니다")
+        expect(self.page.locator("#stop-engine")).to_have_text("■ 자동 재시도 중지")
+        expect(self.page.locator("#start-engine")).to_be_hidden()
+        self.page.locator(".background-guide summary").click()
+        expect(self.page.locator("#background-status")).to_contain_text("현재 백그라운드 실행 중")
+        for width in (1440, 390):
+            self.page.set_viewport_size({"width": width, "height": 1000})
+            self.assertTrue(self.page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1"))
+        self.assertEqual(self.errors, [])
+
     def test_start_transport_failure_does_not_replay_or_claim_running(self):
         self.reset_samples()
         self.page.route("**/api/engine/start", lambda route: route.abort("failed"))
