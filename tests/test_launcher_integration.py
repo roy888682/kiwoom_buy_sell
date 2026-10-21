@@ -167,7 +167,7 @@ class LauncherProcessTests(unittest.TestCase):
             env=self.environment, stdout=self.log, stderr=subprocess.STDOUT,
         )
         self.addCleanup(self.cleanup_process, process)
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             connection = http.client.HTTPConnection(launch.HOST, self.ports[0], timeout=0.5)
             try:
@@ -175,14 +175,21 @@ class LauncherProcessTests(unittest.TestCase):
                 response = connection.getresponse()
                 response.read()
                 if response.status == 200:
-                    return process
+                    # Windows can serve HTTP before CIM exposes the owner's
+                    # command line. Prepare a genuinely identifiable fixture;
+                    # the launcher still performs its own real owner check.
+                    owners = launch._listener_processes(self.ports[0])
+                    if owners and all("-m http.server" in str(row.get("CommandLine") or "").lower()
+                                      for row in owners):
+                        return process
+                    time.sleep(0.1)
             except OSError:
                 if process.poll() is not None:
                     break
                 time.sleep(0.05)
             finally:
                 connection.close()
-        self.fail("Unrelated stdlib HTTP server did not start" + self.diagnostics())
+        self.fail("Unrelated HTTP fixture did not become ready with identifiable process ownership" + self.diagnostics())
 
     def snapshot(self):
         # sqlite3's own context manager ends a transaction but leaves its
