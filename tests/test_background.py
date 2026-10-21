@@ -114,7 +114,9 @@ class StartupTests(unittest.TestCase):
 
     def spawn_case(self, windows):
         with tempfile.TemporaryDirectory(prefix="백그라운드 실행 ") as directory:
-            root = Path(directory)
+            # Windows temp directories can use an 8.3 alias (RUNNER~1).
+            # The launcher deliberately canonicalizes paths before spawning.
+            root = Path(directory).resolve()
             python = root / "venv" / ("python.exe" if windows else "python")
             python.parent.mkdir()
             python.touch()
