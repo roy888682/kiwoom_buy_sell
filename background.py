@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from datetime import datetime
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -15,6 +16,7 @@ from pathlib import Path
 import secrets
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -26,6 +28,40 @@ def paths(root):
     directory = Path(root).resolve() / ".runtime"
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     return directory, directory / "background.json", directory / "background.log"
+
+
+def create_log_path(root):
+    """Reserve a private log for one attempt; never reopen a previous log.
+
+    Windows can deny access to an existing log held by another process or
+    marked read-only. Closing this reservation before spawning also ensures
+    that only the worker owns the output stream, including under pythonw.
+    """
+    try:
+        directory, _, _ = paths(root)
+        descriptor, name = tempfile.mkstemp(
+            prefix=f"background-{datetime.now():%Y%m%d-%H%M%S}-", suffix=".log", dir=directory)
+        os.close(descriptor)
+        return Path(name)
+    except OSError as exc:
+        directory = Path(root).resolve() / ".runtime"
+        raise launch.LauncherError(
+            f"실행 기록을 저장할 수 없습니다: {directory}. "
+            "이 폴더의 쓰기 권한과 Windows 폴더 보호 알림을 확인하세요."
+        ) from exc
+
+
+def worker_owns_lock(root):
+    """A second click may see its child exit while the first is still loading."""
+    directory, _, _ = paths(root)
+    lock = FileLock(directory / "background.lock")
+    try:
+        lock.acquire()
+        return False
+    except InstanceInUseError:
+        return True
+    finally:
+        lock.release()
 
 
 def read_record(root):
@@ -77,10 +113,10 @@ def request_shutdown(record):
         connection.close()
 
 
-def serve(root=launch.ROOT):
+def serve(root=launch.ROOT, *, log_path=None):
     """Own Uvicorn in this interpreter, so pythonw needs no console signals."""
     root = Path(root).resolve()
-    directory, record_path, log_path = paths(root)
+    directory, record_path, _ = paths(root)
     lock = FileLock(directory / "background.lock")
     port_lock = launch.InstanceLock()
     control = None
@@ -124,6 +160,8 @@ def serve(root=launch.ROOT):
         record = {"project_id": project_identity(root), "pid": os.getpid(), "port": port,
                   "control_port": control.server_address[1], "control_token": control_token,
                   "startup_token": os.environ["BREAKLINE_STARTUP_TOKEN"]}
+        if log_path is not None:
+            record["log_file"] = Path(log_path).name
         write_record(record_path, record)
         server.run()
         return 0 if server.started else 1
@@ -167,25 +205,17 @@ def start(root=launch.ROOT, *, opener=None, timeout=60):
         pythonw = python.with_name("pythonw.exe")
         if pythonw.is_file():
             python = pythonw
-    _, _, log_path = paths(root)
-    if log_path.exists() and log_path.stat().st_size > 5 * 1024 * 1024:
-        # A running worker owns its log; rename only when its lock is free.
-        rotation_lock = FileLock(log_path.parent / "background.lock")
-        try:
-            rotation_lock.acquire()
-            os.replace(log_path, log_path.with_suffix(".previous.log"))
-        except (InstanceInUseError, OSError):
-            pass
-        finally:
-            rotation_lock.release()
+    log_path = create_log_path(root)
     options = {"cwd": root, "env": {**os.environ, "PYTHONUTF8": "1"}}
     if os.name == "nt":
         options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         options["start_new_session"] = True
-    with log_path.open("a", encoding="utf-8") as output:
-        subprocess.Popen([str(python), str(root / "background.py"), "--serve"],
-                         stdin=subprocess.DEVNULL, stdout=output, stderr=output, **options)
+    # pythonw has no Python console streams. The worker installs its own log
+    # before configuring Uvicorn; parent and worker never open it together.
+    process = subprocess.Popen([str(python), str(root / "background.py"), "--serve",
+                                "--log-file", str(log_path)], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **options)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         record = read_record(root)
@@ -202,6 +232,10 @@ def start(root=launch.ROOT, *, opener=None, timeout=60):
             if not opener(url):
                 raise launch.LauncherError(f"프로그램은 실행 중입니다. 브라우저 주소창에 {url} 을 직접 입력하세요.")
             return 0
+        if process.poll() is not None and not worker_owns_lock(root):
+            raise launch.LauncherError(
+                f"백그라운드 프로그램이 준비 전에 종료되었습니다 (종료 코드 {process.returncode}). "
+                f"실행 기록: {log_path}. 파일이 비어 있으면 .runtime 폴더의 쓰기 권한과 Windows 보호 알림을 확인하세요.")
         time.sleep(0.25)
     raise launch.LauncherError(f"백그라운드 시작을 확인하지 못했습니다. {log_path} 파일의 마지막 오류를 확인하세요.")
 
@@ -213,7 +247,7 @@ def stop(root=launch.ROOT, *, timeout=60):
         print("확인된 백그라운드 실행이 없습니다. 일반 실행 창은 그 창에서 Ctrl+C로 종료하세요.", flush=True)
         return 0
     if not request_shutdown(record):
-        raise launch.LauncherError("백그라운드 실행을 확인할 수 없어 종료하지 않았습니다. 기존 실행 창과 .runtime/background.log를 확인하세요.")
+        raise launch.LauncherError("백그라운드 실행을 확인할 수 없어 종료하지 않았습니다. 기존 실행 창과 .runtime 폴더의 가장 최근 background-로 시작하는 로그 파일을 확인하세요.")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         latest = read_record(root)
@@ -227,15 +261,19 @@ def stop(root=launch.ROOT, *, timeout=60):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--serve", action="store_true")
+    parser.add_argument("--log-file", type=Path)
     args = parser.parse_args()
     if not args.serve:
         parser.error("Use start-background.bat or stop-background.bat")
-    _, _, log_path = paths(launch.ROOT)
+    directory, _, _ = paths(launch.ROOT)
+    log_path = args.log_file.resolve() if args.log_file else create_log_path(launch.ROOT)
+    if log_path.parent != directory or not log_path.name.startswith("background-") or log_path.suffix != ".log":
+        parser.error("Log files must be background-*.log files in this project's .runtime folder")
     # pythonw may start with stdout/stderr=None. Install streams before Uvicorn
     # creates its console logging handlers.
     with log_path.open("a", encoding="utf-8", buffering=1) as output:
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-            return serve()
+            return serve(log_path=log_path)
 
 
 if __name__ == "__main__":

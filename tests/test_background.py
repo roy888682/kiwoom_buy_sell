@@ -7,10 +7,10 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
-import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -83,6 +83,70 @@ class RecordTests(unittest.TestCase):
 
 
 class StartupTests(unittest.TestCase):
+    def test_each_attempt_gets_a_private_closed_log_without_touching_previous_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            _, _, legacy = background.paths(root)
+            legacy.write_text("original diagnostics", encoding="utf-8")
+            first = background.create_log_path(root)
+            second = background.create_log_path(root)
+            self.assertNotEqual(first, second)
+            self.assertEqual(first.parent, legacy.parent)
+            self.assertEqual(second.parent, legacy.parent)
+            self.assertEqual(legacy.read_text(encoding="utf-8"), "original diagnostics")
+            for path in (first, second):
+                # Closing the reservation lets the worker own the only stream.
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write("한글 실행 기록\n")
+                self.assertEqual(path.read_text(encoding="utf-8"), "한글 실행 기록\n")
+                if os.name != "nt":
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_protected_runtime_directory_reports_access_problem_without_spawning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("background.read_record", return_value=None), patch("background.record_ready", return_value=False), patch("launch.scan_endpoints", return_value=[(8000, "free")]), patch("launch.choose_endpoint", return_value=(8000, "free")), patch("launch.ensure_runtime", return_value=Path(sys.executable)), patch("background.tempfile.mkstemp", side_effect=PermissionError("denied")), patch("background.subprocess.Popen") as spawn:
+                with self.assertRaisesRegex(launch.LauncherError, "폴더의 쓰기 권한"):
+                    background.start(Path(directory), opener=Mock(return_value=True))
+                spawn.assert_not_called()
+
+    def test_main_installs_utf8_streams_even_when_pythonw_has_no_console(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            log_path = background.create_log_path(root)
+
+            def run_worker(*, log_path):
+                print("한글 표준 출력", flush=True)
+                print("한글 오류 출력", file=sys.stderr, flush=True)
+                return 17
+
+            with patch("launch.ROOT", root), patch("sys.argv", ["background.py", "--serve", "--log-file", str(log_path)]), patch("sys.stdout", None), patch("sys.stderr", None), patch("background.serve", side_effect=run_worker) as serve:
+                self.assertEqual(background.main(), 17)
+            serve.assert_called_once_with(log_path=log_path)
+            self.assertEqual(log_path.read_text(encoding="utf-8"), "한글 표준 출력\n한글 오류 출력\n")
+
+    def test_early_child_failure_reports_reserved_log_without_waiting_full_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            child = Mock(returncode=1)
+            child.poll.return_value = 1
+            with patch("background.read_record", return_value=None), patch("background.record_ready", return_value=False), patch("launch.scan_endpoints", return_value=[(8000, "free")]), patch("launch.choose_endpoint", return_value=(8000, "free")), patch("launch.ensure_runtime", return_value=Path(sys.executable)), patch("background.subprocess.Popen", return_value=child) as spawn, patch("background.worker_owns_lock", return_value=False), patch("background.time.sleep") as sleep:
+                with self.assertRaisesRegex(launch.LauncherError, "준비 전에 종료") as error:
+                    background.start(root, opener=Mock(return_value=True))
+            self.assertIn(spawn.call_args.args[0][-1], str(error.exception))
+            sleep.assert_not_called()
+
+    def test_losing_child_waits_for_worker_that_already_owns_the_project_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            record = record_for(root)
+            child = Mock(returncode=1)
+            child.poll.return_value = 1
+            opener = Mock(return_value=True)
+            with patch("background.read_record", side_effect=[None, None, record]), patch("background.record_ready", side_effect=[False, False, True]), patch("launch.scan_endpoints", return_value=[(8000, "free")]), patch("launch.choose_endpoint", return_value=(8000, "free")), patch("launch.ensure_runtime", return_value=Path(sys.executable)), patch("background.subprocess.Popen", return_value=child), patch("background.worker_owns_lock", return_value=True), patch("background.time.sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(background.start(root, opener=opener), 0)
+            sleep.assert_called_once_with(0.25)
+            opener.assert_called_once_with("http://127.0.0.1:8001")
+
     def test_existing_background_is_opened_without_new_process(self):
         record = record_for(launch.ROOT)
         opener = Mock(return_value=True)
@@ -125,14 +189,20 @@ class StartupTests(unittest.TestCase):
             record = record_for(root)
             opener = Mock(return_value=True)
             # Patch only background's os binding, preserving native pathlib.
-            platform_os = SimpleNamespace(name="nt" if windows else "posix", environ={"KEEP": "value"})
+            platform_os = SimpleNamespace(name="nt" if windows else "posix", environ={"KEEP": "value"}, close=os.close)
             with patch("background.os", platform_os), patch("background.read_record", side_effect=[None, record]), patch("background.record_ready", side_effect=[False, True]), patch("launch.scan_endpoints", return_value=[(8000, "free")]), patch("launch.choose_endpoint", return_value=(8000, "free")), patch("launch.ensure_runtime", return_value=python), patch.object(subprocess, "DETACHED_PROCESS", 0x8, create=True), patch.object(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, create=True), patch("background.subprocess.Popen") as spawn, contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(background.start(root, opener=opener), 0)
             command = spawn.call_args.args[0]
-            self.assertEqual(command, [str(python.with_name("pythonw.exe") if windows else python), str(root / "background.py"), "--serve"])
+            self.assertEqual(command[:4], [str(python.with_name("pythonw.exe") if windows else python), str(root / "background.py"), "--serve", "--log-file"])
+            self.assertEqual(len(command), 5)
+            log_path = Path(command[4])
+            self.assertEqual(log_path.parent, root / ".runtime")
+            self.assertTrue(log_path.is_file())
+            self.assertRegex(log_path.name, r"^background-.+\.log$")
             options = spawn.call_args.kwargs
             self.assertEqual(options["stdin"], subprocess.DEVNULL)
-            self.assertIs(options["stdout"], options["stderr"])
+            self.assertEqual(options["stdout"], subprocess.DEVNULL)
+            self.assertEqual(options["stderr"], subprocess.DEVNULL)
             self.assertEqual(options["env"], {"KEEP": "value", "PYTHONUTF8": "1"})
             self.assertEqual(options["cwd"], root)
             if windows:
@@ -145,7 +215,7 @@ class StartupTests(unittest.TestCase):
     def test_windows_detaches_pythonw_and_preserves_utf8_environment(self):
         self.spawn_case(True)
 
-    def test_posix_detaches_and_keeps_stdio_in_log(self):
+    def test_posix_detaches_with_worker_owned_logging(self):
         self.spawn_case(False)
 
     def test_launch_flags_dispatch_without_foreground_start(self):
@@ -159,9 +229,9 @@ class StartupTests(unittest.TestCase):
 
 class WorkerIntegrationTests(unittest.TestCase):
     def test_actual_detached_worker_reuses_identity_and_only_accepts_its_stop_token(self):
-        """Exercise a copied app, its real health endpoint and graceful lifespan."""
+        """Real start -> pythonw/main -> Uvicorn, despite a blocked legacy log."""
         with tempfile.TemporaryDirectory(prefix="백그라운드 test ") as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             for name in ("background.py", "launch.py"):
                 shutil.copy2(launch.ROOT / name, root / name)
             shutil.copytree(launch.ROOT / "app", root / "app",
@@ -169,61 +239,99 @@ class WorkerIntegrationTests(unittest.TestCase):
             with socket.socket() as listener:
                 listener.bind((launch.HOST, 0))
                 port = listener.getsockname()[1]
-            script = (
-                "import functools, launch, background; "
-                "launch.CANDIDATE_PORTS=(int(__import__('os').environ['TEST_PORT']),); "
-                "launch.InstanceLock=functools.partial(launch.InstanceLock, launch.ROOT/'test-port.lock'); "
-                "raise SystemExit(background.serve())"
-            )
-            options = {"start_new_session": True} if os.name != "nt" else {
-                "creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+            # Child imports this isolated launch module through the real CLI.
+            # Only the port and launcher lock are test-specific.
+            with (root / "launch.py").open("a", encoding="utf-8") as module:
+                module.write("\nimport functools\n"
+                             "CANDIDATE_PORTS=(int(os.environ['TEST_PORT']),)\n"
+                             "InstanceLock=functools.partial(InstanceLock, ROOT/'test-port.lock')\n")
             env = {**os.environ, "PYTHONUTF8": "1", "TEST_PORT": str(port),
                    "TRADER_DATA_DIR": str(root / "test-data"), "ALLOW_LIVE_TRADING": "false"}
             # Do not inherit real API credentials into an integration fixture.
             for key in tuple(env):
                 if key.startswith("KIWOOM_"):
                     env[key] = ""
-            log_path = root / "worker-test.log"
+            _, _, legacy_log = background.paths(root)
+            legacy_log.write_text("Keep the previous diagnostic log.\n", encoding="utf-8")
+            legacy_log.chmod(stat.S_IREAD)
+            blocked_handle = None
             record = None
-            with log_path.open("w", encoding="utf-8") as log:
-                child = subprocess.Popen([sys.executable, "-c", script], cwd=root, env=env,
-                                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, **options)
-                try:
-                    deadline = time.monotonic() + 30
-                    while time.monotonic() < deadline:
-                        record = background.read_record(root)
-                        if background.record_ready(root, record):
-                            break
-                        if child.poll() is not None:
-                            self.fail(log_path.read_text(encoding="utf-8"))
-                        time.sleep(0.05)
-                    self.assertTrue(background.record_ready(root, record), log_path.read_text(encoding="utf-8"))
-                    self.assertIsNone(child.poll())
-                    self.assertFalse(background.request_shutdown({**record, "control_token": "wrong-token"}))
-                    self.assertTrue(background.record_ready(root, record))
-                    contender = FileLock(root / ".runtime/background.lock")
-                    with self.assertRaises(InstanceInUseError):
-                        contender.acquire()
-                    opener = Mock(return_value=True)
-                    with patch("background.subprocess.Popen") as spawn:
-                        self.assertEqual(background.start(root, opener=opener), 0)
-                        spawn.assert_not_called()
-                    opener.assert_called_once_with(f"http://127.0.0.1:{port}")
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        self.assertEqual(background.stop(root, timeout=15), 0)
-                    self.assertEqual(child.wait(timeout=10), 0)
-                    self.assertIsNone(background.read_record(root))
-                    self.assertTrue(launch.port_available(port))
+            children = []
+            real_spawn = subprocess.Popen
+
+            def track_child(*args, **kwargs):
+                child = real_spawn(*args, **kwargs)
+                children.append(child)
+                return child
+
+            try:
+                if os.name == "nt":
+                    # Hold the existing filename with no sharing, reproducing
+                    # the Windows PermissionError instead of mocking open().
+                    import ctypes
+                    from ctypes import wintypes
+                    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+                    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                        wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                        wintypes.DWORD, wintypes.HANDLE]
+                    kernel.CreateFileW.restype = wintypes.HANDLE
+                    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+                    kernel.CloseHandle.restype = wintypes.BOOL
+                    blocked_handle = kernel.CreateFileW(str(legacy_log), 0x80000000,
+                        0, None, 3, 0x80, None)  # GENERIC_READ, share=0, OPEN_EXISTING
+                    self.assertNotEqual(blocked_handle, ctypes.c_void_p(-1).value)
+                    with self.assertRaises(PermissionError):
+                        with legacy_log.open("a", encoding="utf-8"):
+                            pass
+                with patch.dict(os.environ, env, clear=True), patch("launch.CANDIDATE_PORTS", (port,)), patch("launch.ensure_runtime", return_value=Path(sys.executable)), patch("background.subprocess.Popen", side_effect=track_child) as spawn, contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(background.start(root, opener=Mock(return_value=True), timeout=30), 0)
+                self.assertEqual(len(children), 1)
+                child = children[0]
+                if os.name == "nt":
+                    self.assertEqual(Path(spawn.call_args.args[0][0]).name.lower(), "pythonw.exe")
+                record = background.read_record(root)
+                self.assertTrue(background.record_ready(root, record))
+                log_path = root / ".runtime" / record["log_file"]
+                self.assertNotEqual(log_path, legacy_log)
+                self.assertTrue(log_path.is_file())
+                self.assertIsNone(child.poll())
+                self.assertFalse(background.request_shutdown({**record, "control_token": "wrong-token"}))
+                self.assertTrue(background.record_ready(root, record))
+                contender = FileLock(root / ".runtime/background.lock")
+                with self.assertRaises(InstanceInUseError):
                     contender.acquire()
-                    contender.release()
-                finally:
-                    if child.poll() is None:
-                        if record:
-                            background.request_shutdown(record)
-                        try:
-                            child.wait(timeout=10)
-                        except subprocess.TimeoutExpired:
-                            # Only terminate this test's own child, never by a
-                            # saved PID or a discovered port owner.
-                            child.terminate()
-                            child.wait(timeout=10)
+                opener = Mock(return_value=True)
+                with patch("background.subprocess.Popen") as spawn:
+                    self.assertEqual(background.start(root, opener=opener), 0)
+                    spawn.assert_not_called()
+                opener.assert_called_once_with(f"http://127.0.0.1:{port}")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(background.stop(root, timeout=15), 0)
+                self.assertEqual(child.wait(timeout=10), 0)
+                self.assertIsNone(background.read_record(root))
+                self.assertTrue(launch.port_available(port))
+                contender.acquire()
+                contender.release()
+                # This log can only contain startup/shutdown messages if the
+                # real main() installed the Python streams before Uvicorn.
+                diagnostic = log_path.read_text(encoding="utf-8")
+                self.assertIn("Application startup complete", diagnostic)
+                self.assertIn("Application shutdown complete", diagnostic)
+            finally:
+                for child in children:
+                    if child.poll() is not None:
+                        continue
+                    record = background.read_record(root)
+                    if record:
+                        background.request_shutdown(record)
+                    try:
+                        child.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        # Only terminate this test's own child, never by a
+                        # saved PID or a discovered port owner.
+                        child.terminate()
+                        child.wait(timeout=10)
+                if blocked_handle is not None:
+                    kernel.CloseHandle(blocked_handle)
+                legacy_log.chmod(stat.S_IREAD | stat.S_IWRITE)
+            self.assertEqual(legacy_log.read_text(encoding="utf-8"), "Keep the previous diagnostic log.\n")
